@@ -713,6 +713,20 @@ def sanitize(name: str, *, max_bytes: int = MAX_LOCAL_COMPONENT_BYTES) -> str:
     return name or "untitled"
 
 
+def sanitize_filename(
+    name: str, *, max_bytes: int = MAX_LOCAL_COMPONENT_BYTES
+) -> str:
+    cleaned = re.sub(r"[\\/:*?\"<>|]+", "_", name).strip(" .")
+    suffix = Path(cleaned).suffix
+    suffix_size = len(suffix.encode("utf-8"))
+    if suffix and suffix_size < max_bytes:
+        stem = truncate_utf8(cleaned[: -len(suffix)], max_bytes - suffix_size)
+        stem = stem.rstrip(" .")
+        if stem:
+            return stem + suffix
+    return sanitize(cleaned, max_bytes=max_bytes)
+
+
 def work_folder_name(work: dict[str, Any]) -> str:
     source = sanitize(str(work.get("source_id") or work.get("id") or "work"))
     title = sanitize(str(work.get("title") or "untitled"))
@@ -826,8 +840,12 @@ def directory_stem_key(file: Mapping[str, Any]) -> tuple[tuple[str, ...], str]:
     parent = tuple(
         unicodedata.normalize("NFC", part).casefold() for part in raw_path[:-1]
     )
-    stem = unicodedata.normalize("NFC", Path(filename).stem).casefold()
-    return parent, stem.split(".", 1)[0]
+    stem = Path(unicodedata.normalize("NFC", filename)).stem
+    if str(file.get("ext") or "").casefold() in SUB_EXTS:
+        embedded_suffix = Path(stem).suffix.casefold()
+        if embedded_suffix in AUDIO_EXTS:
+            stem = Path(stem).stem
+    return parent, unicodedata.normalize("NFC", stem).casefold()
 
 
 def select_files(
@@ -1101,15 +1119,24 @@ class Client:
         )
         if not isinstance(payload, dict):
             raise PayloadError(f"unexpected login payload: {payload!r}")
-        token = payload.get("token") or payload.get("access_token")
         user = payload.get("user") if isinstance(payload.get("user"), dict) else payload
-        if isinstance(user, dict) and not token:
-            token = user.get("token")
-        if not token:
+        token: str | None = None
+        token_sources = [(payload, "token"), (payload, "access_token")]
+        if user is not payload:
+            token_sources.append((user, "token"))
+        for container, key in token_sources:
+            if key not in container:
+                continue
+            candidate = container[key]
+            if not isinstance(candidate, str) or not candidate.strip():
+                raise PayloadError("login succeeded but returned an invalid token")
+            token = candidate.strip()
+            break
+        if token is None:
             raise PayloadError(
                 f"login succeeded but no token in {sorted(payload.keys())}"
             )
-        self.token = str(token)
+        self.token = token
         return self.token, user if isinstance(user, dict) else {}
 
     def whoami(self) -> dict[str, Any]:
@@ -1119,7 +1146,11 @@ class Client:
     def work_info(self, work_id: str | int) -> dict[str, Any]:
         lookup = re.sub(r"^(?:RJ|VJ)0*", "", str(work_id), flags=re.IGNORECASE)
         _, payload = self.request("GET", f"/api/workInfo/{lookup}")
-        if not isinstance(payload, dict):
+        if not isinstance(payload, dict) or not any(
+            (isinstance(value, str) and bool(value.strip()))
+            or (isinstance(value, int) and not isinstance(value, bool))
+            for value in (payload.get("id"), payload.get("source_id"))
+        ):
             raise PayloadError(f"bad workInfo for {work_id}")
         return payload
 
@@ -1303,8 +1334,12 @@ class Client:
 
 
 def relative_file_path(file: dict[str, Any]) -> Path:
-    parts = [sanitize(p) for p in file["path"]]
-    return Path(*parts) if parts else Path(sanitize(file["title"]))
+    raw_parts = [str(part) for part in file["path"]]
+    if not raw_parts:
+        return Path(sanitize_filename(str(file["title"])))
+    parts = [sanitize(part) for part in raw_parts[:-1]]
+    parts.append(sanitize_filename(raw_parts[-1]))
+    return Path(*parts)
 
 
 def part_file_path(dest: Path) -> Path:
@@ -1357,7 +1392,9 @@ def remote_identity_matches(
         return saved.get("source_path") == current.get(
             "source_path"
         ) and saved.get("size") == current.get("size")
-    return dict(saved) == dict(current)
+    # A stable server-provided identity is required for the manifest fast path.
+    # URL paths and sizes alone cannot distinguish same-size replacements.
+    return False
 
 
 def local_path_key(path: Path) -> str:
@@ -2228,6 +2265,9 @@ def download_one(
                     raise DownloadTransportError(
                         f"incomplete HTTP read after {received_size} bytes"
                     ) from exc
+                except http.client.HTTPException as exc:
+                    checkpoint_partial(dest, fh, hasher, remote, selected_etag)
+                    raise DownloadProtocolError(str(exc)) from exc
                 except (
                     TimeoutError,
                     urllib.error.URLError,

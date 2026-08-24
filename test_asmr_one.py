@@ -309,6 +309,28 @@ class SelectBehaviorTests(unittest.TestCase):
             [("English", "voice.wav"), ("English", "voice.srt")],
         )
 
+    def test_subtitles_match_complete_stems_and_embedded_audio_suffixes(self) -> None:
+        english_audio = remote_file("voice.en.wav")
+        japanese_audio = remote_file("voice.ja.mp3")
+        japanese_subtitle = remote_file("voice.ja.srt")
+        japanese_subtitle.update(type="file", ext=".srt")
+        embedded_subtitle = remote_file("voice.en.wav.srt")
+        embedded_subtitle.update(type="file", ext=".srt")
+
+        chosen = select_files(
+            [
+                english_audio,
+                japanese_audio,
+                japanese_subtitle,
+                embedded_subtitle,
+            ],
+            audio_format="wav",
+            include_subs=True,
+            all_langs=True,
+        )
+
+        self.assertEqual(chosen, [english_audio, embedded_subtitle])
+
     def test_conflicting_remote_files_are_not_silently_deduplicated(self) -> None:
         first = remote_file("voice.wav", remote_id="work/first")
         conflicting = remote_file(
@@ -372,6 +394,17 @@ class PathSafetyTests(unittest.TestCase):
             asmr_one.save_partial_state(dest, state)
 
             self.assertTrue(asmr_one.part_state_path(dest).is_file())
+
+    def test_truncated_track_names_preserve_their_extensions(self) -> None:
+        wav = asmr_one.relative_file_path(remote_file("月" * 81 + ".wav"))
+        mp3 = asmr_one.relative_file_path(remote_file("月" * 81 + ".mp3"))
+
+        self.assertEqual(wav.suffix, ".wav")
+        self.assertEqual(mp3.suffix, ".mp3")
+        self.assertNotEqual(wav, mp3)
+        self.assertLessEqual(
+            len(wav.name.encode("utf-8")), asmr_one.MAX_LOCAL_COMPONENT_BYTES
+        )
 
 
 class AuthTests(unittest.TestCase):
@@ -508,6 +541,32 @@ class AuthTests(unittest.TestCase):
 
 
 class ClientTests(unittest.TestCase):
+    def test_login_requires_a_nonempty_string_token(self) -> None:
+        client = asmr_one.Client()
+        invalid_payloads = (
+            {"token": 123},
+            {"token": {"value": "abc"}},
+            {"token": "   "},
+            {"user": {"token": 123}},
+        )
+        for payload in invalid_payloads:
+            with (
+                self.subTest(payload=payload),
+                patch.object(client, "request", return_value=(200, payload)),
+                self.assertRaises(asmr_one.PayloadError),
+            ):
+                client.login("alice", "secret")
+
+        with patch.object(
+            client,
+            "request",
+            return_value=(200, {"access_token": " valid ", "name": "alice"}),
+        ):
+            token, _ = client.login("alice", "secret")
+
+        self.assertEqual(token, "valid")
+        self.assertEqual(client.token, "valid")
+
     def test_bearer_token_is_limited_to_the_api_request(self) -> None:
         requests: list[asmr_one.urllib.request.Request] = []
 
@@ -690,11 +749,27 @@ class ClientTests(unittest.TestCase):
 
     def test_successful_invalid_payload_is_not_retryable(self) -> None:
         client = asmr_one.Client()
-        with patch.object(client, "request", return_value=(200, [])):
-            with self.assertRaises(asmr_one.PayloadError) as raised:
+        invalid_payloads = (
+            [],
+            {},
+            {"error": "not found"},
+            {"id": "", "source_id": " "},
+            {"id": True},
+        )
+        for payload in invalid_payloads:
+            with (
+                self.subTest(payload=payload),
+                patch.object(client, "request", return_value=(200, payload)),
+                self.assertRaises(asmr_one.PayloadError) as raised,
+            ):
                 client.work_info("RJ1")
+            self.assertFalse(
+                asmr_one.is_retryable_network_error(raised.exception)
+            )
 
-        self.assertFalse(asmr_one.is_retryable_network_error(raised.exception))
+        for payload in ({"id": 1}, {"source_id": "RJ000001"}):
+            with patch.object(client, "request", return_value=(200, payload)):
+                self.assertEqual(client.work_info("RJ1"), payload)
 
     def test_mirror_failures_preserve_longest_retry_after(self) -> None:
         mirrors = ("https://preferred.example", "https://fallback.example")
@@ -1086,6 +1161,26 @@ class ChecksumTests(unittest.TestCase):
 
             self.assertEqual(plans[0].status, "valid")
             self.assertEqual(updates, {})
+
+    def test_manifest_without_stable_remote_id_is_never_a_fast_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dest = root / "track.wav"
+            dest.write_bytes(b"hello")
+            file = remote_file(remote_id=None)
+            manifest = asmr_one.empty_checksum_manifest()
+            manifest["files"]["track.wav"] = asmr_one.checksum_record(
+                file, dest, asmr_one.checksum_file(dest)
+            )
+
+            for verify in (False, True):
+                with self.subTest(verify=verify):
+                    plans, updates, _ = asmr_one.classify_local_files(
+                        root, [file], manifest, verify=verify
+                    )
+
+                    self.assertEqual(plans[0].status, "stale")
+                    self.assertEqual(updates, {})
 
     def test_reserved_and_sanitized_path_collisions_are_rejected(self) -> None:
         manifest = asmr_one.empty_checksum_manifest()
@@ -1748,6 +1843,32 @@ class ChecksumTests(unittest.TestCase):
             self.assertEqual(result.status, "ok")
             self.assertEqual(dest.read_bytes(), b"world")
             self.assertIsNone(client.request.call_args.kwargs["range_header"])
+
+    def test_http_protocol_read_error_is_checkpointed_and_retryable(self) -> None:
+        response = MagicMock()
+        response.headers = {"Content-Length": "5"}
+        response.read.side_effect = asmr_one.http.client.LineTooLong("chunk line")
+        client = MagicMock()
+        client.request.return_value = (200, response)
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "track.wav"
+
+            with self.assertRaises(asmr_one.DownloadProtocolError) as raised:
+                asmr_one.download_one(
+                    client,
+                    "https://cdn.example/track.wav",
+                    dest,
+                    5,
+                    resume=False,
+                    remote=download_remote(),
+                )
+
+            self.assertTrue(
+                asmr_one.is_retryable_network_error(raised.exception)
+            )
+            self.assertTrue(asmr_one.part_file_path(dest).is_file())
+            self.assertIsNotNone(asmr_one.load_partial_state(dest))
+            response.close.assert_called_once_with()
 
     def test_stable_remote_id_resumes_after_url_path_refresh(self) -> None:
         old_file = remote_file(
