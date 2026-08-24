@@ -1298,6 +1298,16 @@ def resolve_media_host(
     results: queue.Queue[tuple[list[Any] | None, Exception | None]] = queue.Queue(
         maxsize=1
     )
+    slot_lock = threading.Lock()
+    slot_held = True
+
+    def release_slot() -> None:
+        nonlocal slot_held
+        with slot_lock:
+            if not slot_held:
+                return
+            slot_held = False
+            _media_dns_slots.release()
 
     def resolve() -> None:
         try:
@@ -1311,7 +1321,7 @@ def resolve_media_host(
         else:
             results.put((value, None))
         finally:
-            _media_dns_slots.release()
+            release_slot()
 
     thread = threading.Thread(
         target=resolve,
@@ -1321,12 +1331,13 @@ def resolve_media_host(
     try:
         thread.start()
     except RuntimeError:
-        _media_dns_slots.release()
+        release_slot()
         raise
     remaining = max(0.0, deadline - time.monotonic())
     try:
         resolved, error = results.get(timeout=remaining)
     except queue.Empty as exc:
+        release_slot()
         raise RequestTransportError(
             f"timed out resolving media host {hostname!r}"
         ) from exc
@@ -1657,8 +1668,11 @@ class Client:
             )
             attempts = [(raw_url, None)]
         else:
-            mirrors = (self.mirror,) + tuple(
-                mirror for mirror in DEFAULT_MIRRORS if mirror != self.mirror
+            preferred_mirror = self.mirror
+            mirrors = (preferred_mirror,) + tuple(
+                mirror
+                for mirror in DEFAULT_MIRRORS
+                if mirror != preferred_mirror
             )
             attempts = [
                 (f"{mirror.rstrip('/')}{path}", mirror) for mirror in mirrors

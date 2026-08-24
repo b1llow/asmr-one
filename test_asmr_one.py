@@ -910,6 +910,42 @@ class ClientTests(unittest.TestCase):
             ],
         )
 
+    def test_preferred_mirror_is_snapshotted_once_per_request(self) -> None:
+        class MirrorReadClient(asmr_one.Client):
+            def __init__(self) -> None:
+                self.mirror_reads = 0
+                self.track_mirror_reads = False
+                super().__init__()
+                self.track_mirror_reads = True
+
+            def __getattribute__(self, name: str) -> object:
+                if name == "mirror" and object.__getattribute__(
+                    self, "track_mirror_reads"
+                ):
+                    reads = object.__getattribute__(self, "mirror_reads")
+                    object.__setattr__(self, "mirror_reads", reads + 1)
+                return super().__getattribute__(name)
+
+        mirrors = (
+            "https://preferred.example",
+            "https://second.example",
+            "https://third.example",
+        )
+        with patch.object(asmr_one, "DEFAULT_MIRRORS", mirrors):
+            client = MirrorReadClient()
+            with (
+                patch.object(
+                    client._api_opener,
+                    "open",
+                    side_effect=asmr_one.urllib.error.URLError("down"),
+                ) as open_request,
+                self.assertRaises(asmr_one.RequestTransportError),
+            ):
+                client.request("GET", "/data")
+
+        self.assertEqual(client.mirror_reads, 1)
+        self.assertEqual(open_request.call_count, len(mirrors))
+
     def test_tracks_rejects_malformed_success_payloads(self) -> None:
         client = asmr_one.Client()
         for payload in (
@@ -1400,6 +1436,61 @@ class ClientTests(unittest.TestCase):
 
         self.assertFalse(validation_thread.is_alive())
         self.assertTrue(resolver_finished.wait(timeout=0.5))
+
+    def test_timed_out_dns_resolution_releases_its_slot_once(self) -> None:
+        release_first = threading.Event()
+        first_started = threading.Event()
+        first_finished = threading.Event()
+        counter_lock = threading.Lock()
+        call_count = 0
+        slots = threading.BoundedSemaphore(1)
+
+        def resolution(*_args: object, **_kwargs: object) -> list[object]:
+            nonlocal call_count
+            with counter_lock:
+                call_count += 1
+                current_call = call_count
+            if current_call == 1:
+                first_started.set()
+                release_first.wait()
+                first_finished.set()
+            return [
+                (
+                    asmr_one.socket.AF_INET,
+                    asmr_one.socket.SOCK_STREAM,
+                    6,
+                    "",
+                    ("8.8.8.8", 443),
+                )
+            ]
+
+        try:
+            with (
+                patch.object(asmr_one, "_media_dns_slots", slots),
+                patch(
+                    "asmr_one.socket.getaddrinfo",
+                    side_effect=resolution,
+                ),
+            ):
+                with self.assertRaises(asmr_one.RequestTransportError):
+                    asmr_one.validate_media_url(
+                        "https://stalled.example/file",
+                        timeout=0.02,
+                    )
+                self.assertTrue(first_started.is_set())
+                target = asmr_one.validate_media_url(
+                    "https://healthy.example/file",
+                    timeout=0.5,
+                )
+                self.assertEqual(target.addresses, ("8.8.8.8",))
+                self.assertFalse(first_finished.is_set())
+        finally:
+            release_first.set()
+
+        self.assertTrue(first_finished.wait(timeout=0.5))
+        self.assertTrue(slots.acquire(blocking=False))
+        self.assertFalse(slots.acquire(blocking=False))
+        slots.release()
 
     def test_successful_invalid_payload_is_not_retryable(self) -> None:
         client = asmr_one.Client()
