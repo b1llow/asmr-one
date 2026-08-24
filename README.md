@@ -101,6 +101,10 @@ the five delayed retries, the final transient failure is reported once. `--dry-r
 performs the same local classification (and requested verification) but creates
 neither files nor locks.
 
+Media downloads require credential-free HTTPS URLs. DNS resolution is bounded by
+`--timeout`, every returned address must be public, and the connection is pinned
+to a validated address while TLS still verifies the original hostname.
+
 Filters (opt-in):
 
 - `--format all|mp3|wav|flac|best` — `all` is the default and keeps every

@@ -15,6 +15,7 @@ import ipaddress
 import json
 import math
 import os
+import queue
 import re
 import socket
 import ssl
@@ -95,8 +96,11 @@ MAX_LOCAL_COMPONENT_BYTES = 240
 MAX_WORK_FOLDER_BYTES = 180
 RETRY_DELAYS = (60.0, 5 * 60.0, 30 * 60.0, 4 * 60 * 60.0, 24 * 60 * 60.0)
 MAX_RETRY_AFTER_SECONDS = RETRY_DELAYS[-1]
+MAX_MEDIA_DNS_THREADS = 4
+MAX_MEDIA_ADDRESSES = 16
 
 _print_lock = threading.Lock()
+_media_dns_slots = threading.BoundedSemaphore(MAX_MEDIA_DNS_THREADS)
 
 
 class LocalStateError(RuntimeError):
@@ -173,6 +177,14 @@ class FetchedPage:
     items: list[dict[str, Any]]
     page_count: int | None
     has_more: bool
+
+
+@dataclass(frozen=True)
+class ValidatedMediaTarget:
+    url: str
+    hostname: str
+    port: int
+    addresses: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -276,7 +288,8 @@ class WorkState:
 
     @property
     def shown_id(self) -> str:
-        return str(self.work.get("source_id") or self.work.get("id") or "work")
+        value = self.work.get("source_id") or self.work.get("id") or "work"
+        return single_line_text(value) or "work"
 
 
 def log(msg: str) -> None:
@@ -312,6 +325,36 @@ def ensure_safe_work_directory(root: Path, directory: Path) -> None:
             )
         current.mkdir(exist_ok=True)
         if current.is_symlink() or not current.is_dir():
+            raise LocalStateError(
+                f"download path is not a real directory: {current}"
+            )
+
+
+def ensure_safe_existing_work_directory(root: Path, directory: Path) -> None:
+    try:
+        relative = directory.relative_to(root)
+    except ValueError as exc:
+        raise LocalStateError(
+            f"download directory escapes work root: {directory}"
+        ) from exc
+    if any(part in {"", ".", ".."} for part in relative.parts):
+        raise LocalStateError(f"unsafe download directory: {directory}")
+    if root.is_symlink():
+        raise LocalStateError(f"work directory must not be a symlink: {root}")
+    if not root.exists():
+        return
+    if not root.is_dir():
+        raise LocalStateError(f"work directory is not a real directory: {root}")
+    current = root
+    for part in relative.parts:
+        current /= part
+        if current.is_symlink():
+            raise LocalStateError(
+                f"download directory must not be a symlink: {current}"
+            )
+        if not current.exists():
+            return
+        if not current.is_dir():
             raise LocalStateError(
                 f"download path is not a real directory: {current}"
             )
@@ -656,7 +699,7 @@ def load_token() -> str | None:
         return None
     try:
         data = json.loads(TOKEN_PATH.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     if not isinstance(data, dict):
         return None
@@ -689,6 +732,7 @@ def playlist_display_name(playlist: dict[str, Any]) -> str:
 
 def single_line_text(value: Any) -> str:
     raw = "" if value is None else str(value)
+    raw = re.sub(r"[\x00-\x1f\x7f-\x9f]+", " ", raw)
     return re.sub(r"\s+", " ", raw).strip()
 
 
@@ -751,6 +795,22 @@ def has_usable_work_identity(work: Mapping[str, Any]) -> bool:
     return any(
         is_usable_identifier(work.get(key)) for key in ("id", "source_id")
     )
+
+
+def explicit_work_code_identity(value: Any) -> str:
+    raw = str(value).strip()
+    match = re.fullmatch(r"(RJ|VJ)0*([0-9]+)", raw, flags=re.IGNORECASE)
+    if match is None:
+        return raw.casefold()
+    number = match.group(2).lstrip("0") or "0"
+    return f"{match.group(1).upper()}{number}"
+
+
+def work_lookup_component(value: Any) -> str:
+    raw = str(value).strip()
+    if not raw:
+        raise PayloadError("work lookup is empty")
+    return urllib.parse.quote(raw, safe="")
 
 
 def truncate_utf8(value: str, max_bytes: int) -> str:
@@ -825,6 +885,14 @@ def parse_remote_file_size(value: Any, title: str) -> int | None:
     return size
 
 
+def parse_remote_file_hash(value: Any, title: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise PayloadError(f"track file {title!r} has invalid hash {value!r}")
+    return value.strip()
+
+
 def flatten_tracks(nodes: Any, prefix: tuple[str, ...] = ()) -> list[dict[str, Any]]:
     files: list[dict[str, Any]] = []
     if isinstance(nodes, dict):
@@ -860,7 +928,7 @@ def flatten_tracks(nodes: Any, prefix: tuple[str, ...] = ()) -> list[dict[str, A
                 "path": prefix + (title,),
                 "url": url,
                 "size": parse_remote_file_size(node.get("size"), title),
-                "hash": node.get("hash"),
+                "hash": parse_remote_file_hash(node.get("hash"), title),
                 "type": node.get("type") or "file",
                 "ext": ext,
             }
@@ -1107,7 +1175,7 @@ def read_bounded_body(
     raise PayloadError(f"response body exceeds {limit} bytes")
 
 
-def validate_media_url(url: str) -> None:
+def media_url_destination(url: str) -> tuple[str, int]:
     try:
         parsed = urllib.parse.urlsplit(url)
         port = parsed.port or 443
@@ -1126,20 +1194,78 @@ def validate_media_url(url: str) -> None:
         (".localhost", ".local", ".internal", ".lan", ".home")
     ):
         raise PayloadError(f"media URL targets a local host: {hostname!r}")
-
     try:
-        literal_addresses = [ipaddress.ip_address(hostname)]
+        literal = ipaddress.ip_address(hostname)
     except ValueError:
+        pass
+    else:
+        if not literal.is_global:
+            raise PayloadError(
+                f"media URL resolves to a non-public address: {hostname!r}"
+            )
+    return hostname, port
+
+
+def resolve_media_host(
+    hostname: str, port: int, *, timeout: float
+) -> list[Any]:
+    deadline = time.monotonic() + max(0.0, timeout)
+    if not _media_dns_slots.acquire(timeout=max(0.0, timeout)):
+        raise RequestTransportError(
+            f"timed out waiting to resolve media host {hostname!r}"
+        )
+
+    results: queue.Queue[tuple[list[Any] | None, Exception | None]] = queue.Queue(
+        maxsize=1
+    )
+
+    def resolve() -> None:
         try:
-            resolved = socket.getaddrinfo(
+            value = socket.getaddrinfo(
                 hostname,
                 port,
                 type=socket.SOCK_STREAM,
             )
-        except OSError as exc:
-            raise RequestTransportError(
-                f"cannot resolve media host {hostname!r}: {exc}"
-            ) from exc
+        except (OSError, UnicodeError) as exc:
+            results.put((None, exc))
+        else:
+            results.put((value, None))
+        finally:
+            _media_dns_slots.release()
+
+    thread = threading.Thread(
+        target=resolve,
+        name="asmr-one-media-dns",
+        daemon=True,
+    )
+    try:
+        thread.start()
+    except RuntimeError:
+        _media_dns_slots.release()
+        raise
+    remaining = max(0.0, deadline - time.monotonic())
+    try:
+        resolved, error = results.get(timeout=remaining)
+    except queue.Empty as exc:
+        raise RequestTransportError(
+            f"timed out resolving media host {hostname!r}"
+        ) from exc
+    if error is not None:
+        raise RequestTransportError(
+            f"cannot resolve media host {hostname!r}: {error}"
+        ) from error
+    return resolved or []
+
+
+def validate_media_url(
+    url: str, *, timeout: float = 30.0
+) -> ValidatedMediaTarget:
+    hostname, port = media_url_destination(url)
+
+    try:
+        literal_addresses = [ipaddress.ip_address(hostname)]
+    except ValueError:
+        resolved = resolve_media_host(hostname, port, timeout=timeout)
         literal_addresses = []
         for info in resolved:
             try:
@@ -1151,6 +1277,104 @@ def validate_media_url(url: str) -> None:
         raise RequestTransportError(f"media host {hostname!r} has no IP address")
     if any(not address.is_global for address in literal_addresses):
         raise PayloadError(f"media URL resolves to a non-public address: {hostname!r}")
+    addresses = tuple(
+        dict.fromkeys(str(address) for address in literal_addresses)
+    )[:MAX_MEDIA_ADDRESSES]
+    return ValidatedMediaTarget(url, hostname, port, addresses)
+
+
+def open_pinned_socket(
+    addresses: tuple[str, ...],
+    port: int,
+    timeout: Any,
+    source_address: tuple[Any, ...] | None = None,
+) -> socket.socket:
+    numeric_timeout = (
+        float(timeout) if isinstance(timeout, (int, float)) else None
+    )
+    deadline = (
+        time.monotonic() + max(0.0, numeric_timeout)
+        if numeric_timeout is not None
+        else None
+    )
+    last_error: OSError | None = None
+    for address in addresses:
+        parsed = ipaddress.ip_address(address)
+        family = socket.AF_INET6 if parsed.version == 6 else socket.AF_INET
+        sock = socket.socket(family, socket.SOCK_STREAM)
+        try:
+            if deadline is not None:
+                sock.settimeout(max(0.0, deadline - time.monotonic()))
+            if source_address is not None:
+                sock.bind(source_address)
+            destination: tuple[Any, ...] = (address, port)
+            if family == socket.AF_INET6:
+                destination = (address, port, 0, 0)
+            sock.connect(destination)
+            return sock
+        except OSError as exc:
+            last_error = exc
+            sock.close()
+    if last_error is not None:
+        raise last_error
+    raise OSError("validated media host has no connection address")
+
+
+class PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(
+        self,
+        host: str,
+        *,
+        pinned_addresses: tuple[str, ...],
+        **kwargs: Any,
+    ):
+        super().__init__(host, **kwargs)
+        self._pinned_addresses = pinned_addresses
+
+    def connect(self) -> None:
+        original_create_connection = self._create_connection
+
+        def create_connection(
+            address: tuple[str, int],
+            timeout: Any,
+            source_address: tuple[Any, ...] | None,
+        ) -> socket.socket:
+            return open_pinned_socket(
+                self._pinned_addresses,
+                address[1],
+                timeout,
+                source_address,
+            )
+
+        self._create_connection = create_connection
+        try:
+            super().connect()
+        finally:
+            self._create_connection = original_create_connection
+
+
+class PinnedMediaHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, *, context: ssl.SSLContext, resolution_timeout: float):
+        super().__init__(context=context)
+        self.resolution_timeout = resolution_timeout
+
+    def https_open(self, req: urllib.request.Request) -> Any:
+        url = req.get_full_url()
+        target = getattr(req, "_asmr_media_target", None)
+        if not isinstance(target, ValidatedMediaTarget) or target.url != url:
+            target = validate_media_url(url, timeout=self.resolution_timeout)
+            req._asmr_media_target = target
+
+        def connection(host: str, **kwargs: Any) -> PinnedHTTPSConnection:
+            return PinnedHTTPSConnection(
+                host,
+                pinned_addresses=target.addresses,
+                **kwargs,
+            )
+
+        return self.do_open(connection, req, context=self._context)
+
+    https_request = urllib.request.AbstractHTTPHandler.do_request_
 
 
 class SafeMediaRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -1163,7 +1387,7 @@ class SafeMediaRedirectHandler(urllib.request.HTTPRedirectHandler):
         headers: Mapping[str, str],
         newurl: str,
     ) -> urllib.request.Request | None:
-        validate_media_url(newurl)
+        media_url_destination(newurl)
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
@@ -1174,8 +1398,12 @@ class Client:
         self.mirror = DEFAULT_MIRRORS[0]
         self._ctx = ssl.create_default_context()
         self._media_opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
             SafeMediaRedirectHandler(),
-            urllib.request.HTTPSHandler(context=self._ctx),
+            PinnedMediaHTTPSHandler(
+                context=self._ctx,
+                resolution_timeout=float(timeout),
+            ),
         )
 
     def _open_request(
@@ -1227,9 +1455,13 @@ class Client:
             extra["Range"] = range_header
         last_err: Exception | None = None
         longest_retry_after: float | None = None
+        media_target: ValidatedMediaTarget | None = None
         attempts: list[tuple[str, str | None]]
         if raw_url:
-            validate_media_url(raw_url)
+            media_target = validate_media_url(
+                raw_url,
+                timeout=float(self.timeout),
+            )
             attempts = [(raw_url, None)]
         else:
             mirrors = (self.mirror,) + tuple(
@@ -1245,6 +1477,8 @@ class Client:
                 method=method,
                 headers=self._headers(extra),
             )
+            if media_target is not None:
+                req._asmr_media_target = media_target
             if api_mirror is not None and self.token:
                 # Sent to the selected API mirror, but not copied by urllib
                 # when a redirect targets another origin.
@@ -1258,8 +1492,8 @@ class Client:
                         resp.geturl() if hasattr(resp, "geturl") else url
                     )
                     try:
-                        validate_media_url(str(final_url))
-                    except Exception:
+                        media_url_destination(str(final_url))
+                    except PayloadError:
                         resp.close()
                         raise
                 status = getattr(resp, "status", 200)
@@ -1379,14 +1613,25 @@ class Client:
         return payload
 
     def work_info(self, work_id: str | int) -> dict[str, Any]:
-        lookup = re.sub(r"^(?:RJ|VJ)0*", "", str(work_id), flags=re.IGNORECASE)
+        lookup = work_lookup_component(work_id)
         _, payload = self.request("GET", f"/api/workInfo/{lookup}")
         if not isinstance(payload, dict) or not has_usable_work_identity(payload):
             raise PayloadError(f"bad workInfo for {work_id}")
         return payload
 
     def tracks(self, work_id: str | int) -> list[dict[str, Any]]:
-        lookup = re.sub(r"^(?:RJ|VJ)0*", "", str(work_id), flags=re.IGNORECASE)
+        lookup_value: str | int = work_id
+        if isinstance(work_id, str) and re.fullmatch(
+            r"(?:RJ|VJ)[0-9]+", work_id.strip(), flags=re.IGNORECASE
+        ):
+            work = self.work_info(work_id)
+            resolved_id = work.get("id")
+            if not is_usable_identifier(resolved_id):
+                raise PayloadError(
+                    f"workInfo for {work_id} has no internal track id"
+                )
+            lookup_value = resolved_id
+        lookup = work_lookup_component(lookup_value)
         _, payload = self.request("GET", f"/api/tracks/{lookup}?v=2")
         try:
             return flatten_tracks(payload)
@@ -1418,15 +1663,25 @@ class Client:
             if isinstance(payload.get("pagination"), dict)
             else {}
         )
+
         def pagination_int(value: Any, label: str, *, minimum: int) -> int:
             if isinstance(value, bool):
-                raise PayloadError(f"invalid pagination {label}: {value!r}")
-            try:
-                parsed = int(value)
-            except (TypeError, ValueError) as exc:
                 raise PayloadError(
                     f"invalid pagination {label}: {value!r}"
-                ) from exc
+                )
+            if isinstance(value, int):
+                parsed = value
+            elif isinstance(value, str) and re.fullmatch(
+                r"[0-9]+", value.strip()
+            ):
+                try:
+                    parsed = int(value.strip())
+                except ValueError as exc:
+                    raise PayloadError(
+                        f"invalid pagination {label}: {value!r}"
+                    ) from exc
+            else:
+                raise PayloadError(f"invalid pagination {label}: {value!r}")
             if parsed < minimum:
                 raise PayloadError(f"invalid pagination {label}: {value!r}")
             return parsed
@@ -1613,9 +1868,9 @@ def expected_file_size(file: dict[str, Any]) -> int | None:
 
 def stable_remote_id(file: Mapping[str, Any]) -> str | None:
     value = file.get("hash")
-    if value is None:
+    if not isinstance(value, str):
         return None
-    normalized = str(value).strip()
+    normalized = value.strip()
     return normalized or None
 
 
@@ -1997,6 +2252,22 @@ def prepare_local_files(
     return contexts, manifest_keys_changed
 
 
+def local_context_work_root(context: LocalFileContext) -> Path:
+    relative = Path(context.relative_path)
+    if (
+        relative.is_absolute()
+        or not relative.parts
+        or any(part in {"", ".", ".."} for part in relative.parts)
+    ):
+        raise LocalStateError(
+            f"unsafe local context path: {context.relative_path!r}"
+        )
+    root = context.dest
+    for _part in relative.parts:
+        root = root.parent
+    return root
+
+
 def inspect_local_file(context: LocalFileContext, *, verify: bool) -> FileInspection:
     file = context.file
     dest = context.dest
@@ -2004,6 +2275,8 @@ def inspect_local_file(context: LocalFileContext, *, verify: bool) -> FileInspec
     record = context.record
     part = part_file_path(dest)
     state_path = part_state_path(dest)
+    work_root = local_context_work_root(context)
+    ensure_safe_existing_work_directory(work_root, dest.parent)
     for path in (dest, part, state_path):
         if path.is_symlink():
             raise LocalStateError(f"download target must not be a symlink: {path}")
@@ -2087,7 +2360,10 @@ def inspect_local_file(context: LocalFileContext, *, verify: bool) -> FileInspec
 
 
 def hash_local_file(context: LocalFileContext) -> HashedFile:
+    work_root = local_context_work_root(context)
+    ensure_safe_existing_work_directory(work_root, context.dest.parent)
     digest, stat_result = checksum_file(context.dest, return_stat=True)
+    ensure_safe_existing_work_directory(work_root, context.dest.parent)
     return HashedFile(
         digest,
         checksum_record(
@@ -2204,6 +2480,7 @@ def prepare_download_work(
         all_langs=all_langs,
     )
     root = Path(out) / work_folder_name(work)
+    ensure_safe_existing_work_directory(root, root)
     manifest = load_checksum_manifest(root)
     contexts, manifest_keys_changed = prepare_local_files(root, files, manifest)
     return PreparedWork(root, manifest, contexts, manifest_keys_changed)
@@ -2439,25 +2716,31 @@ def download_one(
     )
     resp: Any | None = None
     try:
-        status, resp = client.request(
-            "GET",
-            "",
-            raw_url=url,
-            stream=True,
-            headers=request_headers,
-            range_header=range_header,
-        )
-    except ApiError as exc:
-        if not existing or exc.status != 416:
+        try:
+            status, resp = client.request(
+                "GET",
+                "",
+                raw_url=url,
+                stream=True,
+                headers=request_headers,
+                range_header=range_header,
+            )
+        except ApiError as exc:
+            if not existing or exc.status != 416:
+                raise
             if partial_fh is not None:
                 partial_fh.close()
-            raise
-        if partial_fh is not None:
-            partial_fh.close()
             partial_fh = None
-        existing = 0
-        hasher = new_blake3_hasher()
-        status, resp = client.request("GET", "", raw_url=url, stream=True)
+            existing = 0
+            hasher = new_blake3_hasher()
+            status, resp = client.request("GET", "", raw_url=url, stream=True)
+    except Exception:
+        try:
+            close_response(resp)
+        finally:
+            if partial_fh is not None and not partial_fh.closed:
+                partial_fh.close()
+        raise
 
     result_status = "ok"
     effective_size = expected_size
@@ -2965,9 +3248,7 @@ class DownloadCoordinator:
         if works:
             seen_codes: set[str] = set()
             for code in works:
-                normalized = re.sub(
-                    r"^(?:RJ|VJ)0*", "", str(code), flags=re.IGNORECASE
-                ).casefold()
+                normalized = explicit_work_code_identity(code)
                 if normalized in seen_codes:
                     continue
                 seen_codes.add(normalized)
@@ -3341,7 +3622,8 @@ class DownloadCoordinator:
         state.remaining_files = len(prepared.files)
         state.prepared = True
         prefix = "DRY ==" if self.args.dry_run else "=="
-        log(f"{prefix} {state.shown_id}  {state.work.get('title')}  -> {prepared.root}")
+        title = single_line_text(state.work.get("title"))
+        log(f"{prefix} {state.shown_id}  {title}  -> {prepared.root}")
         if prepared.manifest_keys_changed and not self.args.dry_run:
             self._mark_manifest_dirty(state)
         for context in prepared.files:
