@@ -650,7 +650,12 @@ def validate_credentials(name: str, password: str) -> None:
 def playlist_display_name(playlist: dict[str, Any]) -> str:
     raw = str(playlist.get("name") or "")
     name = SYSTEM_PLAYLIST_DISPLAY_NAMES.get(raw, raw)
-    return re.sub(r"\s+", " ", name).strip() or "(unnamed)"
+    return single_line_text(name) or "(unnamed)"
+
+
+def single_line_text(value: Any) -> str:
+    raw = "" if value is None else str(value)
+    return re.sub(r"\s+", " ", raw).strip()
 
 
 def select_playlists(
@@ -693,12 +698,25 @@ def select_playlists(
     return selected
 
 
+def is_usable_work_identifier(value: Any) -> bool:
+    return (isinstance(value, str) and bool(value.strip())) or (
+        isinstance(value, int) and not isinstance(value, bool)
+    )
+
+
 def work_identity(work: dict[str, Any]) -> tuple[str, str]:
-    if work.get("id") is not None:
-        return "id", str(work["id"])
-    if work.get("source_id") is not None:
-        return "source_id", str(work["source_id"])
+    for key in ("id", "source_id"):
+        value = work.get(key)
+        if is_usable_work_identifier(value):
+            normalized = value.strip() if isinstance(value, str) else str(value)
+            return key, normalized
     return "payload", json.dumps(work, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def has_usable_work_identity(work: Mapping[str, Any]) -> bool:
+    return any(
+        is_usable_work_identifier(work.get(key)) for key in ("id", "source_id")
+    )
 
 
 def truncate_utf8(value: str, max_bytes: int) -> str:
@@ -759,14 +777,14 @@ def flatten_tracks(nodes: Any, prefix: tuple[str, ...] = ()) -> list[dict[str, A
             raise PayloadError(f"track entry {index} is not an object")
         title = str(node.get("title") or "file")
         children = node.get("children")
+        url = node.get("mediaDownloadUrl") or node.get("mediaStreamUrl")
         if node.get("type") == "folder" or (
-            children is not None and "mediaDownloadUrl" not in node
+            children is not None and not url
         ):
             if not isinstance(children, list):
                 raise PayloadError(f"track folder {title!r} has invalid children")
             files.extend(flatten_tracks(children, prefix + (title,)))
             continue
-        url = node.get("mediaDownloadUrl") or node.get("mediaStreamUrl")
         if not url:
             continue
         ext = Path(urllib.parse.urlsplit(str(url)).path).suffix.lower()
@@ -798,12 +816,14 @@ def object_items(items: list[Any], label: str) -> list[dict[str, Any]]:
 def work_items(items: list[Any], label: str) -> list[dict[str, Any]]:
     works: list[dict[str, Any]] = []
     for index, item in enumerate(object_items(items, label)):
-        if "work" not in item:
-            works.append(item)
-            continue
-        work = item["work"]
-        if not isinstance(work, dict):
-            raise PayloadError(f"{label} entry {index} has invalid work")
+        if "work" in item:
+            work = item["work"]
+            if not isinstance(work, dict):
+                raise PayloadError(f"{label} entry {index} has invalid work")
+        else:
+            work = item
+        if not has_usable_work_identity(work):
+            raise PayloadError(f"{label} entry {index} has no usable work id")
         works.append(work)
     return works
 
@@ -1146,11 +1166,7 @@ class Client:
     def work_info(self, work_id: str | int) -> dict[str, Any]:
         lookup = re.sub(r"^(?:RJ|VJ)0*", "", str(work_id), flags=re.IGNORECASE)
         _, payload = self.request("GET", f"/api/workInfo/{lookup}")
-        if not isinstance(payload, dict) or not any(
-            (isinstance(value, str) and bool(value.strip()))
-            or (isinstance(value, int) and not isinstance(value, bool))
-            for value in (payload.get("id"), payload.get("source_id"))
-        ):
+        if not isinstance(payload, dict) or not has_usable_work_identity(payload):
             raise PayloadError(f"bad workInfo for {work_id}")
         return payload
 
@@ -2226,7 +2242,10 @@ def download_one(
         elif status != 200:
             raise DownloadProtocolError(f"unexpected download HTTP status {status}")
         else:
-            content_length = parse_content_length(headers.get("Content-Length"))
+            try:
+                content_length = parse_content_length(headers.get("Content-Length"))
+            except RuntimeError as exc:
+                raise DownloadProtocolError(str(exc)) from exc
             if (
                 content_length is not None
                 and expected_size is not None
@@ -2412,10 +2431,8 @@ def collect_playlist_works(
 
 def collect_works(client: Client, args: argparse.Namespace) -> list[dict[str, Any]]:
     if args.works:
-        works = []
-        for code in args.works:
-            works.append(client.work_info(code))
-        return works
+        codes = args.works[: args.limit] if args.limit else args.works
+        return [client.work_info(code) for code in codes]
 
     selectors = getattr(args, "playlist_selectors", None)
     if args.source == "review":
@@ -2457,8 +2474,11 @@ def cmd_list(args: argparse.Namespace) -> None:
     works = collect_works(client, args)
     log(f"{len(works)} works")
     for work in works:
-        source = work.get("source_id") or work.get("id")
-        title = work.get("title") or ""
+        source_value = work.get("source_id")
+        if not is_usable_work_identifier(source_value):
+            source_value = work.get("id")
+        source = single_line_text(source_value)
+        title = single_line_text(work.get("title"))
         log(f"{source}\t{title}")
 
 
@@ -2590,7 +2610,7 @@ class DownloadCoordinator:
                 if normalized in seen_codes:
                     continue
                 seen_codes.add(normalized)
-                self._admit_work({"source_id": code}, apply_limit=False)
+                self._admit_work({"source_id": code})
             self.discovery_done = True
         elif self.args.source == "review":
             if getattr(self.args, "playlist_selectors", None):

@@ -706,6 +706,24 @@ class ClientTests(unittest.TestCase):
             tracks,
         )
 
+    def test_stream_only_leaf_with_children_is_not_treated_as_a_folder(self) -> None:
+        payload = [
+            {
+                "title": "voice.wav",
+                "mediaStreamUrl": "https://cdn.example/voice.wav",
+                "children": [],
+                "size": 5,
+                "hash": "work/voice",
+                "type": "audio",
+            }
+        ]
+        client = asmr_one.Client()
+        with patch.object(client, "request", return_value=(200, payload)):
+            tracks = client.tracks("RJ1")
+
+        self.assertEqual(len(tracks), 1)
+        self.assertEqual(tracks[0]["url"], payload[0]["mediaStreamUrl"])
+
     def test_raw_auth_error_is_refreshable_but_api_auth_error_is_not(self) -> None:
         forbidden = asmr_one.urllib.error.HTTPError(
             "https://cdn.example/expired",
@@ -900,6 +918,16 @@ class PlaylistTests(unittest.TestCase):
                     "playlist-id", page=1, page_size=2
                 ),
             ),
+            (
+                {"works": [{}]},
+                lambda: client.playlist_works_page(
+                    "playlist-id", page=1, page_size=2
+                ),
+            ),
+            (
+                {"works": [{"work": {}}]},
+                lambda: client.review_page(page=1, page_size=2),
+            ),
         )
         for payload, fetch in cases:
             with (
@@ -973,6 +1001,22 @@ class PlaylistTests(unittest.TestCase):
         self.assertEqual(works, [{"id": 9}])
         client.iter_collection.assert_called_once_with("review", page_size=25)
         client.iter_playlists.assert_not_called()
+
+    def test_explicit_work_list_honors_limit(self) -> None:
+        client = MagicMock()
+        client.work_info.side_effect = lambda code: {"source_id": code}
+        args = argparse.Namespace(
+            works=["RJ1", "RJ2"],
+            source="auto",
+            page_size=50,
+            limit=1,
+            playlist_selectors=None,
+        )
+
+        works = asmr_one.collect_works(client, args)
+
+        self.assertEqual(works, [{"source_id": "RJ1"}])
+        client.work_info.assert_called_once_with("RJ1")
 
     def test_select_playlists_supports_id_name_and_system_alias(self) -> None:
         playlists = [
@@ -1048,6 +1092,30 @@ class PlaylistTests(unittest.TestCase):
             messages,
             ["2 playlists", "liked-id\tLiked\t14", "custom-id\tcustom name\t9"],
         )
+
+    def test_work_list_command_outputs_one_record_per_line(self) -> None:
+        client = MagicMock()
+        client.work_info.return_value = {
+            "source_id": "RJ1\nspoof",
+            "title": "first\nsecond\tthird",
+        }
+        messages: list[str] = []
+        args = argparse.Namespace(
+            timeout=30,
+            works=["RJ1"],
+            source="auto",
+            page_size=50,
+            limit=None,
+            playlist_selectors=None,
+        )
+
+        with (
+            patch("asmr_one.require_client", return_value=client),
+            patch("asmr_one.log", side_effect=messages.append),
+        ):
+            asmr_one.cmd_list(args)
+
+        self.assertEqual(messages, ["1 works", "RJ1 spoof\tfirst second third"])
 
     def test_work_and_playlist_options_are_mutually_exclusive(self) -> None:
         stderr = io.StringIO()
@@ -1869,6 +1937,28 @@ class ChecksumTests(unittest.TestCase):
             self.assertTrue(asmr_one.part_file_path(dest).is_file())
             self.assertIsNotNone(asmr_one.load_partial_state(dest))
             response.close.assert_called_once_with()
+
+    def test_malformed_full_content_length_is_retryable(self) -> None:
+        for value in ("invalid", "-1"):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as tmp:
+                response = FakeResponse(b"hello", {"Content-Length": value})
+                client = MagicMock()
+                client.request.return_value = (200, response)
+
+                with self.assertRaises(asmr_one.DownloadProtocolError) as raised:
+                    asmr_one.download_one(
+                        client,
+                        "https://cdn.example/track.wav",
+                        Path(tmp) / "track.wav",
+                        5,
+                        resume=False,
+                        remote=download_remote(),
+                    )
+
+                self.assertTrue(
+                    asmr_one.is_retryable_network_error(raised.exception)
+                )
+                self.assertTrue(response.closed)
 
     def test_stable_remote_id_resumes_after_url_path_refresh(self) -> None:
         old_file = remote_file(
@@ -2996,6 +3086,26 @@ class GlobalTaskSchedulerTests(unittest.TestCase):
         self.assertEqual(client.work_info.call_count, 2)
         client.tracks.assert_called_once_with(1)
         self.assertEqual(len(coordinator.outcomes), 1)
+
+    def test_explicit_downloads_honor_limit(self) -> None:
+        client = MagicMock()
+        client.work_info.side_effect = lambda code: self.work(
+            int(str(code).removeprefix("RJ"))
+        )
+        client.tracks.return_value = []
+        with tempfile.TemporaryDirectory() as tmp, patch("asmr_one.log"):
+            summary = asmr_one.DownloadCoordinator(
+                client,
+                coordinator_args(
+                    tmp,
+                    works=["RJ1", "RJ2"],
+                    limit=1,
+                ),
+            ).run_collection()
+
+        self.assertEqual((summary.works, summary.fail), (1, 0))
+        client.work_info.assert_called_once_with("RJ1")
+        client.tracks.assert_called_once_with(1)
 
     def test_files_in_one_work_download_concurrently_and_share_manifest(self) -> None:
         work = self.work(1)
