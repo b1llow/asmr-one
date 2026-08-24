@@ -299,7 +299,7 @@ def log(msg: str) -> None:
 
 
 def die(msg: str, code: int = 1) -> None:
-    print(f"error: {msg}", file=sys.stderr)
+    print(f"error: {single_line_text(msg)}", file=sys.stderr)
     raise SystemExit(code)
 
 
@@ -703,24 +703,26 @@ def config_dir() -> Path:
 def load_token() -> str | None:
     env = os.environ.get("ASMR_TOKEN")
     if env is not None:
-        normalized = env.strip()
+        normalized = normalize_bearer_token(env)
         if normalized:
             return normalized
     if not TOKEN_PATH.is_file():
         return None
     try:
         data = json.loads(TOKEN_PATH.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, ValueError, RecursionError):
         return None
     if not isinstance(data, dict):
         return None
-    token = data.get("token")
-    return token.strip() if isinstance(token, str) and token.strip() else None
+    return normalize_bearer_token(data.get("token"))
 
 
 def save_token(token: str, name: str | None = None) -> None:
+    normalized = normalize_bearer_token(token)
+    if normalized is None:
+        raise ValueError("token is not safe for an HTTP Authorization header")
     config_dir()
-    payload = {"token": token}
+    payload = {"token": normalized}
     if name:
         payload["name"] = name
     save_json_atomic(TOKEN_PATH, payload, prefix=".token.")
@@ -746,6 +748,17 @@ def normalize_unicode_scalars(value: str) -> str:
         "\ufffd" if 0xD800 <= ord(character) <= 0xDFFF else character
         for character in value
     )
+
+
+def normalize_bearer_token(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if not normalized or not normalized.isascii():
+        return None
+    if any(not 0x21 <= ord(character) <= 0x7E for character in normalized):
+        return None
+    return normalized
 
 
 def single_line_text(value: Any) -> str:
@@ -1481,7 +1494,12 @@ class SameOriginAuthRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 class Client:
     def __init__(self, token: str | None = None, timeout: int = 30):
-        self.token = token
+        normalized_token = normalize_bearer_token(token)
+        if token is not None and normalized_token is None:
+            raise PayloadError(
+                "token is not safe for an HTTP Authorization header"
+            )
+        self.token = normalized_token
         self.timeout = timeout
         self.mirror = DEFAULT_MIRRORS[0]
         self._ctx = ssl.create_default_context()
@@ -1570,11 +1588,16 @@ class Client:
             )
             if media_target is not None:
                 req._asmr_media_target = media_target
-            if api_mirror is not None and self.token:
+            if api_mirror is not None and self.token is not None:
                 # Sent to the selected API mirror, but not copied by urllib
                 # when a redirect targets another origin.
+                token = normalize_bearer_token(self.token)
+                if token is None:
+                    raise PayloadError(
+                        "token is not safe for an HTTP Authorization header"
+                    )
                 req.add_unredirected_header(
-                    "Authorization", f"Bearer {self.token}"
+                    "Authorization", f"Bearer {token}"
                 )
             try:
                 resp = self._open_request(req, media=raw_url is not None)
@@ -1605,8 +1628,10 @@ class Client:
                         ) from exc
                     try:
                         payload = json.loads(decoded)
-                    except json.JSONDecodeError:
-                        payload = raw
+                    except (ValueError, RecursionError) as exc:
+                        raise PayloadError(
+                            "successful response body is not valid JSON"
+                        ) from exc
                 else:
                     payload = None
                 if api_mirror is not None:
@@ -1686,9 +1711,10 @@ class Client:
             if key not in container:
                 continue
             candidate = container[key]
-            if not isinstance(candidate, str) or not candidate.strip():
+            normalized = normalize_bearer_token(candidate)
+            if normalized is None:
                 raise PayloadError("login succeeded but returned an invalid token")
-            token = candidate.strip()
+            token = normalized
             break
         if token is None:
             raise PayloadError(
@@ -3203,8 +3229,23 @@ def collect_playlist_works(
 
 def collect_works(client: Client, args: argparse.Namespace) -> list[dict[str, Any]]:
     if args.works:
-        codes = args.works[: args.limit] if args.limit else args.works
-        return [client.work_info(code) for code in codes]
+        works: list[dict[str, Any]] = []
+        seen_codes: set[str] = set()
+        seen_works: set[tuple[str, str]] = set()
+        for code in args.works:
+            code_identity = explicit_work_code_identity(code)
+            if code_identity in seen_codes:
+                continue
+            seen_codes.add(code_identity)
+            work = client.work_info(code)
+            identity = work_identity(work)
+            if identity in seen_works:
+                continue
+            seen_works.add(identity)
+            works.append(work)
+            if args.limit is not None and len(works) >= args.limit:
+                break
+        return works
 
     selectors = getattr(args, "playlist_selectors", None)
     if args.source == "review":
@@ -3472,8 +3513,9 @@ class DownloadCoordinator:
         delay: float,
     ) -> None:
         log(
-            f"RETRY collection {label} attempt={attempt}/{total} "
-            f"after={format_delay(delay)}  {exc}"
+            f"RETRY collection {single_line_text(label)} "
+            f"attempt={attempt}/{total} "
+            f"after={format_delay(delay)}  {single_line_text(exc)}"
         )
 
     def _start_review_stream(self) -> None:
@@ -3591,7 +3633,7 @@ class DownloadCoordinator:
         if self.discovery_stopped:
             return
         self.collection_failures += 1
-        log(f"FAIL collection: {exc}")
+        log(f"FAIL collection: {single_line_text(exc)}")
         self._stop_discovery()
 
     def _admit_work(self, work: dict[str, Any], *, apply_limit: bool = True) -> None:
@@ -3684,14 +3726,21 @@ class DownloadCoordinator:
         if state.completed:
             return
         log(
-            f"RETRY [{state.shown_id}] {label} attempt={attempt}/{total} "
-            f"after={format_delay(delay)}  {exc}"
+            f"RETRY [{state.shown_id}] {single_line_text(label)} "
+            f"attempt={attempt}/{total} "
+            f"after={format_delay(delay)}  {single_line_text(exc)}"
         )
         self._fill_active_works()
 
     def _start_work(self, state: WorkState) -> None:
-        if state.work.get("id") is None:
+        if not is_usable_identifier(state.work.get("id")):
             lookup = state.work.get("source_id")
+            if not is_usable_identifier(lookup):
+                self._fail_work(
+                    state,
+                    PayloadError("work has no usable id or source_id"),
+                )
+                return
             self._enqueue_work_task(
                 state,
                 label="work-info",
@@ -3774,8 +3823,10 @@ class DownloadCoordinator:
         self._schedule_tracks(state)
 
     def _schedule_tracks(self, state: WorkState) -> None:
-        work_id = state.work.get("id") or state.work.get("source_id")
-        if work_id is None:
+        work_id = state.work.get("id")
+        if not is_usable_identifier(work_id):
+            work_id = state.work.get("source_id")
+        if not is_usable_identifier(work_id):
             self._fail_work(state, PayloadError("work is missing its id"))
             return
         self._enqueue_work_task(
@@ -3947,7 +3998,10 @@ class DownloadCoordinator:
         exc: BaseException,
     ) -> None:
         state.fail += 1
-        log(f"  [{state.shown_id}] FAIL   {context.relative_path}  {exc}")
+        log(
+            f"  [{state.shown_id}] FAIL   {context.relative_path}  "
+            f"{single_line_text(exc)}"
+        )
         self._finish_file(state)
 
     def _finish_file(self, state: WorkState) -> None:
@@ -4005,7 +4059,10 @@ class DownloadCoordinator:
         if not state.manifest_failed:
             state.manifest_failed = True
             state.fail += 1
-            log(f"FAIL work {state.shown_id} manifest: {exc}")
+            log(
+                f"FAIL work {state.shown_id} manifest: "
+                f"{single_line_text(exc)}"
+            )
         self._maybe_complete_work(state)
 
     def _maybe_complete_work(self, state: WorkState) -> None:
@@ -4049,7 +4106,7 @@ class DownloadCoordinator:
         state.completed = True
         self.scheduler.discard_ready(state.owner)
         state.fail += 1
-        log(f"FAIL work {state.shown_id}: {exc}")
+        log(f"FAIL work {state.shown_id}: {single_line_text(exc)}")
         self.outcomes.append(
             WorkOutcome(state.shown_id, state.ok, state.skip, state.fail)
         )

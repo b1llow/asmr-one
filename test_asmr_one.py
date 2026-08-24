@@ -201,6 +201,26 @@ class MainTests(unittest.TestCase):
             self.assertIn(f"error: {error}", stderr.getvalue())
             self.assertNotIn("Traceback", stderr.getvalue())
 
+    def test_remote_error_text_cannot_forge_stderr_lines(self) -> None:
+        error = ApiError(400, "first\nFORGED\x1b[31m\ud800")
+        handler = MagicMock(side_effect=error)
+        parser = MagicMock()
+        parser.parse_args.return_value = argparse.Namespace(func=handler)
+        stderr = io.StringIO()
+
+        with (
+            patch("asmr_one.build_parser", return_value=parser),
+            redirect_stderr(stderr),
+            self.assertRaises(SystemExit),
+        ):
+            asmr_one.main([])
+
+        output = stderr.getvalue()
+        self.assertEqual(len(output.splitlines()), 1)
+        self.assertNotIn("\x1b", output)
+        self.assertNotRegex(output, r"[\ud800-\udfff]")
+        self.assertIn("first FORGED [31m\ufffd", output)
+
 
 class SelectTests(unittest.TestCase):
     @classmethod
@@ -545,6 +565,36 @@ class AuthTests(unittest.TestCase):
             ):
                 self.assertIsNone(asmr_one.load_token())
 
+    def test_tokens_unsafe_for_http_headers_are_rejected(self) -> None:
+        invalid_tokens = ("bad\nheader", "snowman-\u2603", "two words")
+        for token in invalid_tokens:
+            with self.subTest(token=token), tempfile.TemporaryDirectory() as tmp:
+                token_path = Path(tmp) / "token.json"
+                token_path.write_text(
+                    json.dumps({"token": token}),
+                    encoding="utf-8",
+                )
+                with (
+                    patch.object(asmr_one, "TOKEN_PATH", token_path),
+                    patch.dict(os.environ, {}, clear=True),
+                ):
+                    self.assertIsNone(asmr_one.load_token())
+                with self.assertRaises(ValueError):
+                    asmr_one.save_token(token)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            token_path = Path(tmp) / "token.json"
+            token_path.write_text('{"token": "saved-token"}', encoding="utf-8")
+            with (
+                patch.object(asmr_one, "TOKEN_PATH", token_path),
+                patch.dict(
+                    os.environ,
+                    {"ASMR_TOKEN": "bad\nheader"},
+                    clear=True,
+                ),
+            ):
+                self.assertEqual(asmr_one.load_token(), "saved-token")
+
     def test_require_client_auto_logs_in_from_environment(self) -> None:
         args = argparse.Namespace(timeout=12)
         with (
@@ -650,6 +700,9 @@ class ClientTests(unittest.TestCase):
             {"token": 123},
             {"token": {"value": "abc"}},
             {"token": "   "},
+            {"token": "bad\nheader"},
+            {"token": "snowman-\u2603"},
+            {"token": "two words"},
             {"user": {"token": 123}},
         )
         for payload in invalid_payloads:
@@ -669,6 +722,22 @@ class ClientTests(unittest.TestCase):
 
         self.assertEqual(token, "valid")
         self.assertEqual(client.token, "valid")
+
+    def test_client_rejects_an_unsafe_bearer_token_at_every_request(self) -> None:
+        for token in ("bad\nheader", "snowman-\u2603", "two words", ""):
+            with self.subTest(token=token), self.assertRaises(
+                asmr_one.PayloadError
+            ):
+                asmr_one.Client(token=token)
+
+        client = asmr_one.Client()
+        client.token = "bad\nheader"
+        with (
+            patch.object(client._api_opener, "open") as open_request,
+            self.assertRaises(asmr_one.PayloadError),
+        ):
+            client.request("GET", "/data")
+        open_request.assert_not_called()
 
     def test_whoami_rejects_non_object_success_payloads(self) -> None:
         client = asmr_one.Client()
@@ -1105,6 +1174,27 @@ class ClientTests(unittest.TestCase):
 
         self.assertFalse(asmr_one.is_retryable_network_error(raised.exception))
         self.assertTrue(response.closed)
+
+    def test_json_decoder_resource_errors_are_payload_errors(self) -> None:
+        decoder_errors = (
+            ValueError("integer string conversion limit exceeded"),
+            RecursionError("maximum recursion depth exceeded"),
+        )
+        for decoder_error in decoder_errors:
+            client = asmr_one.Client()
+            response = FakeResponse(b"{}")
+            with (
+                self.subTest(decoder_error=decoder_error),
+                patch.object(client._api_opener, "open", return_value=response),
+                patch("asmr_one.json.loads", side_effect=decoder_error),
+                self.assertRaises(asmr_one.PayloadError) as raised,
+            ):
+                client.request("GET", "/data")
+            self.assertIn("not valid JSON", str(raised.exception))
+            self.assertFalse(
+                asmr_one.is_retryable_network_error(raised.exception)
+            )
+            self.assertTrue(response.closed)
 
     def test_media_urls_reject_local_targets_and_unsafe_final_redirects(self) -> None:
         client = asmr_one.Client()
@@ -1621,6 +1711,30 @@ class PlaylistTests(unittest.TestCase):
 
         self.assertEqual(works, [{"source_id": "RJ1"}])
         client.work_info.assert_called_once_with("RJ1")
+
+    def test_explicit_work_list_deduplicates_before_applying_limit(self) -> None:
+        client = MagicMock()
+
+        def work_info(code: str) -> dict[str, object]:
+            number = 2 if asmr_one.explicit_work_code_identity(code) == "RJ2" else 1
+            return {"id": number, "source_id": f"RJ{number}"}
+
+        client.work_info.side_effect = work_info
+        args = argparse.Namespace(
+            works=["rj0001", "RJ1", "1", "RJ2"],
+            source="auto",
+            page_size=50,
+            limit=2,
+            playlist_selectors=None,
+        )
+
+        works = asmr_one.collect_works(client, args)
+
+        self.assertEqual([work["id"] for work in works], [1, 2])
+        self.assertEqual(
+            [call.args[0] for call in client.work_info.call_args_list],
+            ["rj0001", "1", "RJ2"],
+        )
 
     def test_select_playlists_supports_id_name_and_system_alias(self) -> None:
         playlists = [
@@ -3586,6 +3700,22 @@ class GlobalTaskSchedulerTests(unittest.TestCase):
         self.assertEqual(client.work_info.call_count, 2)
         self.assertEqual(client.tracks.call_count, 2)
         self.assertEqual(clock.sleeps, [60.0, 60.0])
+
+    def test_malformed_internal_id_is_resolved_through_source_id(self) -> None:
+        client = MagicMock()
+        client.work_info.return_value = self.work(1)
+        client.tracks.return_value = []
+        malformed = {"id": True, "source_id": "RJ1", "title": "Work 1"}
+
+        with tempfile.TemporaryDirectory() as tmp, patch("asmr_one.log"):
+            summary = asmr_one.DownloadCoordinator(
+                client,
+                download_args(tmp, dry_run=True),
+            ).run_direct([malformed])
+
+        self.assertEqual((summary.works, summary.fail), (1, 0))
+        client.work_info.assert_called_once_with("RJ1")
+        client.tracks.assert_called_once_with(1)
 
     def test_refresh_does_not_rebind_missing_stable_id_by_path(self) -> None:
         work = self.work(1)
