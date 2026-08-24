@@ -691,9 +691,11 @@ class ClientTests(unittest.TestCase):
             requests.append(request)
             return FakeResponse(b"{}")
 
-        client = asmr_one.Client(token="secret")
+        with patch.object(
+            asmr_one, "DEFAULT_MIRRORS", ("https://api.example",)
+        ):
+            client = asmr_one.Client(token="secret")
         with (
-            patch.object(asmr_one, "DEFAULT_MIRRORS", ("https://api.example",)),
             patch.object(
                 client,
                 "_open_request",
@@ -721,7 +723,21 @@ class ClientTests(unittest.TestCase):
         raw_request, api_request = requests
         self.assertIsNone(raw_request.get_header("Authorization"))
         self.assertEqual(api_request.get_header("Authorization"), "Bearer secret")
-        redirected = asmr_one.urllib.request.HTTPRedirectHandler().redirect_request(
+        handler = asmr_one.SameOriginAuthRedirectHandler()
+        same_origin = handler.redirect_request(
+            api_request,
+            None,
+            302,
+            "Found",
+            {},
+            "https://api.example/redirected",
+        )
+        self.assertIsNotNone(same_origin)
+        self.assertEqual(
+            same_origin.get_header("Authorization"),
+            "Bearer secret",
+        )
+        cross_origin = handler.redirect_request(
             api_request,
             None,
             302,
@@ -729,8 +745,8 @@ class ClientTests(unittest.TestCase):
             {},
             "https://cdn.example/redirected",
         )
-        self.assertIsNotNone(redirected)
-        self.assertIsNone(redirected.get_header("Authorization"))
+        self.assertIsNotNone(cross_origin)
+        self.assertIsNone(cross_origin.get_header("Authorization"))
 
     def test_successful_fallback_mirror_is_promoted(self) -> None:
         mirrors = ("https://preferred.example", "https://fallback.example")
@@ -752,14 +768,12 @@ class ClientTests(unittest.TestCase):
                 raise response
             return response
 
-        with (
-            patch.object(asmr_one, "DEFAULT_MIRRORS", mirrors),
-            patch("asmr_one.urllib.request.urlopen", side_effect=urlopen),
-        ):
+        with patch.object(asmr_one, "DEFAULT_MIRRORS", mirrors):
             client = asmr_one.Client()
-            client.request("GET", "/first")
-            self.assertEqual(client.mirror, mirrors[1])
-            client.request("GET", "/second")
+            with patch.object(client._api_opener, "open", side_effect=urlopen):
+                client.request("GET", "/first")
+                self.assertEqual(client.mirror, mirrors[1])
+                client.request("GET", "/second")
 
         self.assertEqual(
             attempts,
@@ -1048,8 +1062,7 @@ class ClientTests(unittest.TestCase):
         client = asmr_one.Client()
         response = FakeResponse(b"12345")
         with (
-            patch.object(asmr_one, "DEFAULT_MIRRORS", ("https://api.example",)),
-            patch("asmr_one.urllib.request.urlopen", return_value=response),
+            patch.object(client._api_opener, "open", return_value=response),
             patch.object(asmr_one, "MAX_API_RESPONSE_BYTES", 4),
             self.assertRaises(asmr_one.PayloadError) as raised,
         ):
@@ -1062,8 +1075,7 @@ class ClientTests(unittest.TestCase):
         client = asmr_one.Client()
         response = FakeResponse(b"\xff")
         with (
-            patch.object(asmr_one, "DEFAULT_MIRRORS", ("https://api.example",)),
-            patch("asmr_one.urllib.request.urlopen", return_value=response),
+            patch.object(client._api_opener, "open", return_value=response),
             self.assertRaises(asmr_one.PayloadError) as raised,
         ):
             client.request("GET", "/data")
@@ -1175,31 +1187,50 @@ class ClientTests(unittest.TestCase):
 
     def test_media_dns_resolution_has_a_deadline(self) -> None:
         release = threading.Event()
-        started = threading.Event()
+        resolver_started = threading.Event()
+        resolver_finished = threading.Event()
+        validation_finished = threading.Event()
+        errors: list[Exception] = []
 
         def stalled_resolution(*_args: object, **_kwargs: object) -> list[object]:
-            started.set()
-            release.wait(timeout=1)
+            resolver_started.set()
+            release.wait()
+            resolver_finished.set()
             return []
 
-        try:
-            with (
-                patch(
-                    "asmr_one.socket.getaddrinfo",
-                    side_effect=stalled_resolution,
-                ),
-                self.assertRaises(asmr_one.RequestTransportError) as raised,
-            ):
+        def validate() -> None:
+            try:
                 asmr_one.validate_media_url(
                     "https://cdn.example/file",
                     timeout=0.02,
                 )
-            self.assertTrue(started.is_set())
-            self.assertTrue(
-                asmr_one.is_retryable_network_error(raised.exception)
-            )
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                validation_finished.set()
+
+        validation_thread = threading.Thread(target=validate)
+
+        try:
+            with patch(
+                "asmr_one.socket.getaddrinfo",
+                side_effect=stalled_resolution,
+            ):
+                validation_thread.start()
+                self.assertTrue(resolver_started.wait(timeout=0.5))
+                self.assertTrue(validation_finished.wait(timeout=0.5))
+                self.assertFalse(resolver_finished.is_set())
+                self.assertEqual(len(errors), 1)
+                self.assertIsInstance(
+                    errors[0], asmr_one.RequestTransportError
+                )
+                self.assertTrue(asmr_one.is_retryable_network_error(errors[0]))
         finally:
             release.set()
+            validation_thread.join(timeout=0.5)
+
+        self.assertFalse(validation_thread.is_alive())
+        self.assertTrue(resolver_finished.wait(timeout=0.5))
 
     def test_successful_invalid_payload_is_not_retryable(self) -> None:
         client = asmr_one.Client()
@@ -1241,16 +1272,15 @@ class ClientTests(unittest.TestCase):
             {},
             io.BytesIO(b"unavailable"),
         )
-        with (
-            patch.object(asmr_one, "DEFAULT_MIRRORS", mirrors),
-            patch(
-                "asmr_one.urllib.request.urlopen",
-                side_effect=(rate_limited, unavailable),
-            ),
-        ):
+        with patch.object(asmr_one, "DEFAULT_MIRRORS", mirrors):
             client = asmr_one.Client()
-            with self.assertRaises(ApiError) as raised:
-                client.request("GET", "/data")
+            with patch.object(
+                client._api_opener,
+                "open",
+                side_effect=(rate_limited, unavailable),
+            ):
+                with self.assertRaises(ApiError) as raised:
+                    client.request("GET", "/data")
 
         self.assertEqual(raised.exception.status, 503)
         self.assertEqual(asmr_one.retry_after_seconds(raised.exception), 3600.0)
@@ -1416,6 +1446,24 @@ class PlaylistTests(unittest.TestCase):
                 self.assertFalse(
                     asmr_one.is_retryable_network_error(raised.exception)
                 )
+
+    def test_pages_reject_a_reported_page_that_was_not_requested(self) -> None:
+        client = asmr_one.Client()
+        for field in ("currentPage", "page"):
+            payload = {
+                "playlists": [],
+                "pagination": {field: 1, "pageCount": 2},
+            }
+            with (
+                self.subTest(field=field),
+                patch.object(client, "request", return_value=(200, payload)),
+                self.assertRaises(asmr_one.PayloadError) as raised,
+            ):
+                client.playlists_page(filter_by="all", page=2, page_size=2)
+            self.assertIn("does not match requested page 2", str(raised.exception))
+            self.assertFalse(
+                asmr_one.is_retryable_network_error(raised.exception)
+            )
 
     def test_collect_works_uses_all_playlists_and_deduplicates(self) -> None:
         client = MagicMock()

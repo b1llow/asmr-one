@@ -1391,12 +1391,70 @@ class SafeMediaRedirectHandler(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
+def url_origin(url: str) -> tuple[str, str, int] | None:
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        scheme = parsed.scheme.casefold()
+        if scheme not in {"http", "https"}:
+            return None
+        hostname = parsed.hostname
+        if hostname is None:
+            return None
+        default_port = 443 if scheme == "https" else 80
+        port = parsed.port or default_port
+    except ValueError:
+        return None
+    return scheme, hostname.rstrip(".").casefold(), port
+
+
+class SameOriginAuthRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Mapping[str, str],
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        redirected = super().redirect_request(
+            req,
+            fp,
+            code,
+            msg,
+            headers,
+            newurl,
+        )
+        source_origin = url_origin(req.full_url)
+        if (
+            redirected is None
+            or source_origin is None
+            or source_origin != url_origin(newurl)
+        ):
+            return redirected
+        authorization = next(
+            (
+                value
+                for key, value in req.unredirected_hdrs.items()
+                if key.casefold() == "authorization"
+            ),
+            None,
+        )
+        if authorization is not None:
+            redirected.add_unredirected_header("Authorization", authorization)
+        return redirected
+
+
 class Client:
     def __init__(self, token: str | None = None, timeout: int = 30):
         self.token = token
         self.timeout = timeout
         self.mirror = DEFAULT_MIRRORS[0]
         self._ctx = ssl.create_default_context()
+        self._api_opener = urllib.request.build_opener(
+            SameOriginAuthRedirectHandler(),
+            urllib.request.HTTPSHandler(context=self._ctx),
+        )
         self._media_opener = urllib.request.build_opener(
             urllib.request.ProxyHandler({}),
             SafeMediaRedirectHandler(),
@@ -1414,10 +1472,9 @@ class Client:
     ) -> Any:
         if media:
             return self._media_opener.open(request, timeout=self.timeout)
-        return urllib.request.urlopen(
+        return self._api_opener.open(
             request,
             timeout=self.timeout,
-            context=self._ctx,
         )
 
     def _headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:
@@ -1694,6 +1751,11 @@ class Client:
             if current_value is None
             else pagination_int(current_value, "current page", minimum=1)
         )
+        if current_value is not None and current != page:
+            raise PayloadError(
+                f"pagination current page {current} does not match "
+                f"requested page {page}"
+            )
         page_count_value = pagination.get("pageCount")
         if page_count_value is None:
             page_count_value = pagination.get("totalPages")
