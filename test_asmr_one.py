@@ -263,6 +263,76 @@ class SelectBehaviorTests(unittest.TestCase):
             [("日本語", "voice.wav"), ("日本語", "scene.mp4")],
         )
 
+    def test_ja_only_does_not_fall_back_to_other_languages(self) -> None:
+        chosen = select_files(
+            [
+                remote_file("voice.wav", path=("English", "voice.wav")),
+                remote_file("root.wav"),
+            ],
+            audio_format="all",
+            include_subs=True,
+            all_langs=False,
+        )
+
+        self.assertEqual(chosen, [])
+
+    def test_subtitles_match_audio_within_the_same_directory(self) -> None:
+        english_audio = remote_file(
+            "voice.wav", path=("English", "voice.wav")
+        )
+        english_subtitle = remote_file(
+            "voice.srt", path=("English", "voice.srt")
+        )
+        english_subtitle.update(type="file", ext=".srt")
+        japanese_audio = remote_file(
+            "voice.mp3", path=("日本語", "voice.mp3")
+        )
+        japanese_subtitle = remote_file(
+            "voice.srt", path=("日本語", "voice.srt")
+        )
+        japanese_subtitle.update(type="file", ext=".srt")
+
+        chosen = select_files(
+            [
+                english_audio,
+                english_subtitle,
+                japanese_audio,
+                japanese_subtitle,
+            ],
+            audio_format="wav",
+            include_subs=True,
+            all_langs=True,
+        )
+
+        self.assertEqual(
+            [file["path"] for file in chosen],
+            [("English", "voice.wav"), ("English", "voice.srt")],
+        )
+
+    def test_conflicting_remote_files_are_not_silently_deduplicated(self) -> None:
+        first = remote_file("voice.wav", remote_id="work/first")
+        conflicting = remote_file(
+            "voice.wav",
+            url="https://cdn.example/other.wav",
+            remote_id="work/second",
+        )
+
+        chosen = select_files(
+            [first, dict(first), conflicting],
+            audio_format="all",
+            include_subs=True,
+            all_langs=True,
+        )
+
+        self.assertEqual(chosen, [first, conflicting])
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(asmr_one.LocalStateError, "collide"):
+                asmr_one.prepare_local_files(
+                    Path(tmp),
+                    chosen,
+                    asmr_one.empty_checksum_manifest(),
+                )
+
 
 class PathSafetyTests(unittest.TestCase):
     def test_work_folder_sanitizes_source_and_limits_utf8_bytes(self) -> None:
@@ -551,6 +621,31 @@ class ClientTests(unittest.TestCase):
 
             self.assertEqual(len(tracks), 1)
             self.assertEqual(tracks[0]["title"], "track.wav")
+
+    def test_track_title_supplies_extension_for_opaque_url(self) -> None:
+        payload = [
+            {
+                "title": "voice.wav",
+                "mediaDownloadUrl": "https://cdn.example/download/opaque",
+                "size": 5,
+                "hash": "work/voice",
+                "type": "audio",
+            }
+        ]
+        client = asmr_one.Client()
+        with patch.object(client, "request", return_value=(200, payload)):
+            tracks = client.tracks("RJ1")
+
+        self.assertEqual(tracks[0]["ext"], ".wav")
+        self.assertEqual(
+            select_files(
+                tracks,
+                audio_format="wav",
+                include_subs=False,
+                all_langs=True,
+            ),
+            tracks,
+        )
 
     def test_raw_auth_error_is_refreshable_but_api_auth_error_is_not(self) -> None:
         forbidden = asmr_one.urllib.error.HTTPError(
@@ -3051,6 +3146,17 @@ class GlobalTaskSchedulerTests(unittest.TestCase):
                     asmr_one.build_parser().parse_args(
                         [command, "--limit", value, "--work", "RJ1"]
                     )
+
+    def test_parser_rejects_non_positive_timeout(self) -> None:
+        for value in ("0", "-1"):
+            with (
+                self.subTest(value=value),
+                redirect_stderr(io.StringIO()),
+                self.assertRaises(SystemExit),
+            ):
+                asmr_one.build_parser().parse_args(
+                    ["--timeout", value, "list", "--work", "RJ1"]
+                )
 
 
 if __name__ == "__main__":

@@ -755,7 +755,9 @@ def flatten_tracks(nodes: Any, prefix: tuple[str, ...] = ()) -> list[dict[str, A
         url = node.get("mediaDownloadUrl") or node.get("mediaStreamUrl")
         if not url:
             continue
-        ext = Path(str(url).split("?", 1)[0]).suffix.lower()
+        ext = Path(urllib.parse.urlsplit(str(url)).path).suffix.lower()
+        if not ext:
+            ext = Path(title).suffix.lower()
         files.append(
             {
                 "title": title,
@@ -818,6 +820,16 @@ def format_rank(ext: str, preferred: str) -> int:
     return 0 if ext == want else 9
 
 
+def directory_stem_key(file: Mapping[str, Any]) -> tuple[tuple[str, ...], str]:
+    raw_path = tuple(str(part) for part in file.get("path") or ())
+    filename = raw_path[-1] if raw_path else str(file.get("title") or "")
+    parent = tuple(
+        unicodedata.normalize("NFC", part).casefold() for part in raw_path[:-1]
+    )
+    stem = unicodedata.normalize("NFC", Path(filename).stem).casefold()
+    return parent, stem.split(".", 1)[0]
+
+
 def select_files(
     files: list[dict[str, Any]],
     *,
@@ -826,8 +838,7 @@ def select_files(
     all_langs: bool,
 ) -> list[dict[str, Any]]:
     if not all_langs:
-        best_lang = min((path_lang_score(f["path"]) for f in files), default=1)
-        files = [f for f in files if path_lang_score(f["path"]) == best_lang]
+        files = [f for f in files if path_lang_score(f["path"]) == 0]
 
     if audio_format == "all":
         chosen = [f for f in files if include_subs or f["ext"] not in SUB_EXTS]
@@ -841,20 +852,21 @@ def select_files(
             audio = [f for f in audio if f["ext"].lower() == wanted]
         chosen = list(audio)
         if include_subs:
-            audio_stems = {Path(f["title"]).stem.lower() for f in audio}
+            audio_keys = {directory_stem_key(f) for f in audio}
             for f in files:
-                if f["ext"] in SUB_EXTS and Path(f["title"]).stem.lower().split(".", 1)[
-                    0
-                ] in {s.split(".", 1)[0] for s in audio_stems}:
+                if f["ext"] in SUB_EXTS and directory_stem_key(f) in audio_keys:
                     chosen.append(f)
-    # de-dupe by relative path
-    seen: set[tuple[str, ...]] = set()
+    # De-duplicate repeated identical entries, but retain conflicting identities
+    # so local path preparation can reject them explicitly.
+    seen: dict[tuple[str, ...], dict[str, Any]] = {}
     out: list[dict[str, Any]] = []
     for f in chosen:
-        key = f["path"]
-        if key in seen:
+        key = tuple(str(part) for part in f["path"])
+        previous = seen.get(key)
+        if previous == f:
             continue
-        seen.add(key)
+        if previous is None:
+            seen[key] = f
         out.append(f)
     return out
 
@@ -3187,7 +3199,7 @@ def build_parser() -> argparse.ArgumentParser:
             "per-work download API."
         ),
     )
-    p.add_argument("--timeout", type=int, default=30)
+    p.add_argument("--timeout", type=positive_int, default=30)
     sub = p.add_subparsers(dest="cmd", required=True)
 
     login = sub.add_parser(
