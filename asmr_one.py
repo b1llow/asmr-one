@@ -266,6 +266,7 @@ class ScheduledTask:
 class WorkState:
     owner: str
     work: dict[str, Any]
+    counts_toward_limit: bool = True
     root: Path | None = None
     manifest: dict[str, Any] | None = None
     remaining_files: int = 0
@@ -294,7 +295,7 @@ class WorkState:
 
 def log(msg: str) -> None:
     with _print_lock:
-        print(msg, flush=True)
+        print(normalize_unicode_scalars(msg), flush=True)
 
 
 def die(msg: str, code: int = 1) -> None:
@@ -647,9 +648,19 @@ class OrderedPageStream:
                 return
             self._final_page = result.page_count
         elif result.has_more:
+            if self._final_page is not None and page >= self._final_page:
+                self._fail(
+                    RuntimeError(f"{self.label} pagination changed while fetching")
+                )
+                return
             self._schedule(page + 1)
-        else:
+        elif self._final_page is None:
             self._final_page = page
+        elif page > self._final_page:
+            self._fail(
+                RuntimeError(f"{self.label} pagination changed while fetching")
+            )
+            return
 
         self._pages[page] = result
         while self._next_to_emit in self._pages:
@@ -730,8 +741,15 @@ def playlist_display_name(playlist: dict[str, Any]) -> str:
     return single_line_text(name) or "(unnamed)"
 
 
+def normalize_unicode_scalars(value: str) -> str:
+    return "".join(
+        "\ufffd" if 0xD800 <= ord(character) <= 0xDFFF else character
+        for character in value
+    )
+
+
 def single_line_text(value: Any) -> str:
-    raw = "" if value is None else str(value)
+    raw = normalize_unicode_scalars("" if value is None else str(value))
     raw = re.sub(r"[\x00-\x1f\x7f-\x9f]+", " ", raw)
     return re.sub(r"\s+", " ", raw).strip()
 
@@ -806,6 +824,19 @@ def explicit_work_code_identity(value: Any) -> str:
     return f"{match.group(1).upper()}{number}"
 
 
+def internal_work_id_identity(value: Any) -> str | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return str(value)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    normalized = value.strip()
+    if re.fullmatch(r"[0-9]+", normalized):
+        return str(int(normalized))
+    return normalized
+
+
 def work_lookup_component(value: Any) -> str:
     raw = str(value).strip()
     if not raw:
@@ -814,12 +845,14 @@ def work_lookup_component(value: Any) -> str:
 
 
 def truncate_utf8(value: str, max_bytes: int) -> str:
+    value = normalize_unicode_scalars(value)
     if len(value.encode("utf-8")) <= max_bytes:
         return value
     return value.encode("utf-8")[:max_bytes].decode("utf-8", "ignore")
 
 
 def sanitize(name: str, *, max_bytes: int = MAX_LOCAL_COMPONENT_BYTES) -> str:
+    name = normalize_unicode_scalars(name)
     name = re.sub(r"[\x00-\x1f\x7f-\x9f\\/:*?\"<>|]+", "_", name).strip(
         " ."
     )
@@ -830,6 +863,7 @@ def sanitize(name: str, *, max_bytes: int = MAX_LOCAL_COMPONENT_BYTES) -> str:
 def sanitize_filename(
     name: str, *, max_bytes: int = MAX_LOCAL_COMPONENT_BYTES
 ) -> str:
+    name = normalize_unicode_scalars(name)
     cleaned = re.sub(
         r"[\x00-\x1f\x7f-\x9f\\/:*?\"<>|]+", "_", name
     ).strip(" .")
@@ -1674,6 +1708,25 @@ class Client:
         _, payload = self.request("GET", f"/api/workInfo/{lookup}")
         if not isinstance(payload, dict) or not has_usable_work_identity(payload):
             raise PayloadError(f"bad workInfo for {work_id}")
+        requested = str(work_id).strip()
+        if re.fullmatch(
+            r"(?:RJ|VJ)[0-9]+", requested, flags=re.IGNORECASE
+        ):
+            returned_source = payload.get("source_id")
+            if (
+                not isinstance(returned_source, str)
+                or explicit_work_code_identity(returned_source)
+                != explicit_work_code_identity(requested)
+            ):
+                raise PayloadError(
+                    f"workInfo identity does not match requested work {work_id!r}"
+                )
+        elif internal_work_id_identity(payload.get("id")) != (
+            internal_work_id_identity(work_id)
+        ):
+            raise PayloadError(
+                f"workInfo identity does not match requested work {work_id!r}"
+            )
         return payload
 
     def tracks(self, work_id: str | int) -> list[dict[str, Any]]:
@@ -2199,29 +2252,63 @@ def new_blake3_hasher() -> Any:
     return blake3(max_threads=1)
 
 
-def update_hasher_from_file(hasher: Any, path: Path) -> None:
-    if path.is_symlink() or not path.is_file():
-        raise LocalStateError(f"checksum target is not a regular file: {path}")
-    with path.open("rb") as fh:
-        while chunk := fh.read(DOWNLOAD_CHUNK_SIZE):
-            hasher.update(chunk)
+def update_hasher_from_file(hasher: Any, file_handle: Any) -> None:
+    while chunk := file_handle.read(DOWNLOAD_CHUNK_SIZE):
+        hasher.update(chunk)
 
 
 def checksum_file(
     path: Path, *, return_stat: bool = False
 ) -> str | tuple[str, os.stat_result]:
-    if path.is_symlink() or not path.is_file():
-        raise LocalStateError(f"checksum target is not a regular file: {path}")
-    before = path.stat()
-    hasher = new_blake3_hasher()
-    update_hasher_from_file(hasher, path)
-    if path.is_symlink() or not path.is_file():
-        raise LocalStateError(f"checksum target changed while hashing: {path}")
-    after = path.stat()
-    if stat_signature(before) != stat_signature(after):
-        raise LocalStateError(f"checksum target changed while hashing: {path}")
-    digest = hasher.hexdigest()
-    return (digest, after) if return_stat else digest
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise LocalStateError(
+            f"cannot safely open checksum target {path}: {exc}"
+        ) from exc
+    try:
+        before = os.fstat(descriptor)
+        try:
+            linked_before = path.lstat()
+        except OSError as exc:
+            raise LocalStateError(
+                f"checksum target changed before hashing: {path}"
+            ) from exc
+        if (
+            not stat_module.S_ISREG(before.st_mode)
+            or not stat_module.S_ISREG(linked_before.st_mode)
+            or stat_signature(before) != stat_signature(linked_before)
+        ):
+            raise LocalStateError(
+                f"checksum target is not a stable regular file: {path}"
+            )
+        hasher = new_blake3_hasher()
+        with os.fdopen(descriptor, "rb", closefd=False) as file_handle:
+            update_hasher_from_file(hasher, file_handle)
+        after = os.fstat(descriptor)
+        try:
+            linked_after = path.lstat()
+        except OSError as exc:
+            raise LocalStateError(
+                f"checksum target changed while hashing: {path}"
+            ) from exc
+        if (
+            not stat_module.S_ISREG(linked_after.st_mode)
+            or stat_signature(before) != stat_signature(after)
+            or stat_signature(after) != stat_signature(linked_after)
+        ):
+            raise LocalStateError(f"checksum target changed while hashing: {path}")
+        digest = hasher.hexdigest()
+        return (digest, after) if return_stat else digest
+    finally:
+        os.close(descriptor)
 
 
 def checksum_record(
@@ -3283,11 +3370,14 @@ class DownloadCoordinator:
         self.client = client
         self.args = args
         self.scheduler = TaskScheduler(args.jobs)
-        self.pending_works: deque[dict[str, Any]] = deque()
+        self.pending_works: deque[tuple[dict[str, Any], bool]] = deque()
+        self.deferred_works: deque[dict[str, Any]] = deque()
         self.active_works: dict[str, WorkState] = {}
         self.outcomes: list[WorkOutcome] = []
         self.seen_works: set[tuple[str, str]] = set()
         self.resolved_work_owners: dict[tuple[str, str], str] = {}
+        self.resolved_limited_works = 0
+        self.work_root_owners: dict[str, tuple[str, str]] = {}
         self.admitted_works = 0
         self.collection_failures = 0
         self.discovery_stopped = False
@@ -3494,6 +3584,7 @@ class DownloadCoordinator:
     def _stop_discovery(self) -> None:
         self.discovery_stopped = True
         self.discovery_done = True
+        self.deferred_works.clear()
         self.scheduler.discard_ready(self.DISCOVERY_OWNER)
 
     def _collection_error(self, exc: BaseException) -> None:
@@ -3507,18 +3598,31 @@ class DownloadCoordinator:
         if self.discovery_stopped and apply_limit:
             return
         limit = getattr(self.args, "limit", None)
-        if apply_limit and limit and limit > 0 and self.admitted_works >= limit:
-            self._stop_discovery()
-            return
         identity = work_identity(work)
         if identity in self.seen_works:
             return
         self.seen_works.add(identity)
-        self.pending_works.append(work)
+        if apply_limit and limit and self.admitted_works >= limit:
+            self.deferred_works.append(work)
+            return
+        self._activate_work(work, counts_toward_limit=apply_limit)
+
+    def _activate_work(
+        self, work: dict[str, Any], *, counts_toward_limit: bool
+    ) -> None:
+        self.pending_works.append((work, counts_toward_limit))
         self.admitted_works += 1
         self._fill_active_works()
-        if apply_limit and limit and limit > 0 and self.admitted_works >= limit:
-            self._stop_discovery()
+
+    def _drain_deferred_works(self) -> None:
+        limit = getattr(self.args, "limit", None)
+        if not limit or self.discovery_stopped:
+            return
+        while self.deferred_works and self.admitted_works < limit:
+            self._activate_work(
+                self.deferred_works.popleft(),
+                counts_toward_limit=True,
+            )
 
     def _fill_active_works(self) -> None:
         def runnable_count() -> int:
@@ -3533,7 +3637,12 @@ class DownloadCoordinator:
         ):
             self._work_serial += 1
             owner = f"work:{self._work_serial}"
-            state = WorkState(owner, self.pending_works.popleft())
+            work, counts_toward_limit = self.pending_works.popleft()
+            state = WorkState(
+                owner,
+                work,
+                counts_toward_limit=counts_toward_limit,
+            )
             self.active_works[owner] = state
             self._start_work(state)
 
@@ -3605,6 +3714,11 @@ class DownloadCoordinator:
         existing_owner = self.resolved_work_owners.get(identity)
         if existing_owner is None:
             self.resolved_work_owners[identity] = state.owner
+            if state.counts_toward_limit:
+                self.resolved_limited_works += 1
+                limit = getattr(self.args, "limit", None)
+                if limit and self.resolved_limited_works >= limit:
+                    self._stop_discovery()
             return True
         if existing_owner == state.owner:
             return True
@@ -3615,14 +3729,28 @@ class DownloadCoordinator:
             raise RuntimeError("negative admitted work count")
         log(f"SKIP duplicate work {state.shown_id}")
         self.active_works.pop(state.owner, None)
+        if state.counts_toward_limit:
+            self._drain_deferred_works()
         self._fill_active_works()
         return False
 
     def _schedule_work_lock(self, state: WorkState) -> None:
+        root = Path(self.args.out) / work_folder_name(state.work)
+        root_key = local_path_key(root.absolute())
+        identity = work_identity(state.work)
+        existing_identity = self.work_root_owners.get(root_key)
+        if existing_identity is not None and existing_identity != identity:
+            self._fail_work(
+                state,
+                LocalStateError(
+                    f"distinct works map to the same output directory: {root}"
+                ),
+            )
+            return
+        self.work_root_owners[root_key] = identity
         if self.args.dry_run:
             self._schedule_tracks(state)
             return
-        root = Path(self.args.out) / work_folder_name(state.work)
         self._enqueue_work_task(
             state,
             label="work-lock",

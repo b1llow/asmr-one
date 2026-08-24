@@ -452,16 +452,17 @@ class PathSafetyTests(unittest.TestCase):
 
     def test_local_names_replace_control_characters(self) -> None:
         relative = asmr_one.relative_file_path(
-            remote_file("voice\nFAIL\x1b\x85.wav")
+            remote_file("voice\nFAIL\x1b\x85\ud800.wav")
         )
         folder = work_folder_name(
-            {"source_id": "RJ1\r", "title": "title\tspoof\x7f"}
+            {"source_id": "RJ1\r", "title": "title\tspoof\x7f\udfff"}
         )
 
         for value in (*relative.parts, folder):
             self.assertFalse(
                 any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in value)
             )
+            self.assertNotRegex(value, r"[\ud800-\udfff]")
 
 
 class AuthTests(unittest.TestCase):
@@ -958,8 +959,8 @@ class ClientTests(unittest.TestCase):
             client,
             "request",
             side_effect=(
-                (200, {"id": 1}),
-                (200, {"id": 2}),
+                (200, {"id": 1, "source_id": "VJ000123"}),
+                (200, {"id": 2, "source_id": "RJ000123"}),
                 (200, []),
             ),
         ) as request:
@@ -974,6 +975,28 @@ class ClientTests(unittest.TestCase):
                 "/api/tracks/2?v=2",
             ],
         )
+
+    def test_work_info_rejects_a_mismatched_requested_identity(self) -> None:
+        client = asmr_one.Client()
+        cases = (
+            ("RJ000123", {"id": 1, "source_id": "RJ000124"}),
+            ("VJ000123", {"id": 1, "source_id": "RJ000123"}),
+            (123, {"id": 124, "source_id": "RJ000123"}),
+        )
+        for requested, payload in cases:
+            with (
+                self.subTest(requested=requested, payload=payload),
+                patch.object(client, "request", return_value=(200, payload)),
+                self.assertRaises(asmr_one.PayloadError) as raised,
+            ):
+                client.work_info(requested)
+            self.assertFalse(
+                asmr_one.is_retryable_network_error(raised.exception)
+            )
+
+        payload = {"id": 123, "source_id": "RJ000123"}
+        with patch.object(client, "request", return_value=(200, payload)):
+            self.assertEqual(client.work_info("000123"), payload)
 
     def test_stream_only_leaf_with_children_is_not_treated_as_a_folder(self) -> None:
         payload = [
@@ -1252,9 +1275,13 @@ class ClientTests(unittest.TestCase):
                 asmr_one.is_retryable_network_error(raised.exception)
             )
 
-        for payload in ({"id": 1}, {"source_id": "RJ000001"}):
+        successes = (
+            (1, {"id": 1}),
+            ("RJ1", {"id": 1, "source_id": "RJ000001"}),
+        )
+        for requested, payload in successes:
             with patch.object(client, "request", return_value=(200, payload)):
-                self.assertEqual(client.work_info("RJ1"), payload)
+                self.assertEqual(client.work_info(requested), payload)
 
     def test_mirror_failures_preserve_longest_retry_after(self) -> None:
         mirrors = ("https://preferred.example", "https://fallback.example")
@@ -1653,7 +1680,11 @@ class PlaylistTests(unittest.TestCase):
         client.iter_playlists.return_value = iter(
             [
                 {"id": "liked-id", "name": "__SYS_PLAYLIST_LIKED", "works_count": 14},
-                {"id": "custom-id", "name": "custom\nname", "works_count": 9},
+                {
+                    "id": "custom-id",
+                    "name": "custom\nname\ud800",
+                    "works_count": 9,
+                },
             ]
         )
         messages: list[str] = []
@@ -1667,14 +1698,14 @@ class PlaylistTests(unittest.TestCase):
 
         self.assertEqual(
             messages,
-            ["2 playlists", "liked-id\tLiked\t14", "custom-id\tcustom name\t9"],
+            ["2 playlists", "liked-id\tLiked\t14", "custom-id\tcustom name\ufffd\t9"],
         )
 
     def test_work_list_command_outputs_one_record_per_line(self) -> None:
         client = MagicMock()
         client.work_info.return_value = {
             "source_id": "RJ1\nspoof",
-            "title": "first\nsecond\tthird",
+            "title": "first\nsecond\tthird\udfff",
         }
         messages: list[str] = []
         args = argparse.Namespace(
@@ -1692,7 +1723,10 @@ class PlaylistTests(unittest.TestCase):
         ):
             asmr_one.cmd_list(args)
 
-        self.assertEqual(messages, ["1 works", "RJ1 spoof\tfirst second third"])
+        self.assertEqual(
+            messages,
+            ["1 works", "RJ1 spoof\tfirst second third\ufffd"],
+        )
 
     def test_work_and_playlist_options_are_mutually_exclusive(self) -> None:
         stderr = io.StringIO()
@@ -1901,11 +1935,11 @@ class ChecksumTests(unittest.TestCase):
             )
             original_update = asmr_one.update_hasher_from_file
 
-            def replace_after_hash(hasher: object, path: Path) -> None:
-                original_update(hasher, path)
-                replacement = path.with_name("replacement.wav")
+            def replace_after_hash(hasher: object, file_handle: object) -> None:
+                original_update(hasher, file_handle)
+                replacement = dest.with_name("replacement.wav")
                 replacement.write_bytes(b"world")
-                os.replace(replacement, path)
+                os.replace(replacement, dest)
 
             with (
                 patch(
@@ -1917,6 +1951,29 @@ class ChecksumTests(unittest.TestCase):
                 ),
             ):
                 asmr_one.hash_local_file(context)
+
+    def test_checksum_open_does_not_follow_a_swapped_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dest = root / "track.wav"
+            outside = root / "outside.wav"
+            dest.write_bytes(b"hello")
+            outside.write_bytes(b"private")
+            real_open = os.open
+
+            def swap_before_open(path: object, flags: int) -> int:
+                self.assertEqual(Path(path), dest)
+                dest.unlink()
+                dest.symlink_to(outside)
+                return real_open(path, flags)
+
+            with (
+                patch("asmr_one.os.open", side_effect=swap_before_open),
+                self.assertRaises(asmr_one.LocalStateError),
+            ):
+                asmr_one.checksum_file(dest)
+
+            self.assertEqual(outside.read_bytes(), b"private")
 
     def test_stale_destination_can_resume_matching_replacement_partial(self) -> None:
         old = remote_file(remote_id="work/old")
@@ -3166,6 +3223,40 @@ class GlobalTaskSchedulerTests(unittest.TestCase):
         self.assertEqual(tasks[-1].label, "collection page=4")
         self.assertEqual(len(tasks), 4)
 
+    def test_short_page_does_not_replace_a_reported_final_page(self) -> None:
+        scheduler = MagicMock()
+        scheduler.jobs = 2
+        tasks: list[asmr_one.ScheduledTask] = []
+        scheduler.enqueue.side_effect = tasks.append
+        done = MagicMock()
+        failures: list[BaseException] = []
+        stream = asmr_one.OrderedPageStream(
+            scheduler,
+            owner="pages",
+            label="collection",
+            fetch_page=lambda page: self.fail(f"unexpected fetch {page}"),
+            on_items=lambda _items: None,
+            on_done=done,
+            on_error=failures.append,
+            should_stop=lambda: False,
+        )
+
+        stream.start()
+        tasks[0].on_success(asmr_one.FetchedPage([{"id": 1}], 5, True))
+        tasks[1].on_success(asmr_one.FetchedPage([], None, False))
+
+        self.assertEqual(
+            [task.label for task in tasks],
+            [
+                "collection page=1",
+                "collection page=2",
+                "collection page=3",
+                "collection page=4",
+            ],
+        )
+        done.assert_not_called()
+        self.assertEqual(failures, [])
+
     def test_scheduler_enforces_one_global_worker_limit(self) -> None:
         scheduler = asmr_one.TaskScheduler(2)
         barrier = threading.Barrier(2)
@@ -3878,6 +3969,60 @@ class GlobalTaskSchedulerTests(unittest.TestCase):
         self.assertEqual(client.work_info.call_count, 2)
         client.tracks.assert_called_once_with(1)
         self.assertEqual(len(coordinator.outcomes), 1)
+
+    def test_limit_continues_after_resolved_aliases_reduce_the_count(self) -> None:
+        client = MagicMock()
+        barrier = threading.Barrier(2)
+
+        def work_info(code: str) -> dict[str, object]:
+            if code in {"RJ000001", "000001"}:
+                barrier.wait(timeout=3)
+                return self.work(1)
+            return self.work(2)
+
+        client.work_info.side_effect = work_info
+        client.tracks.return_value = []
+        with tempfile.TemporaryDirectory() as tmp, patch("asmr_one.log"):
+            coordinator = asmr_one.DownloadCoordinator(
+                client,
+                coordinator_args(
+                    tmp,
+                    works=["RJ000001", "000001", "RJ000002"],
+                    jobs=2,
+                    limit=2,
+                ),
+            )
+            summary = coordinator.run_collection()
+
+        self.assertEqual((summary.works, summary.fail), (2, 0))
+        self.assertCountEqual(
+            [call.args[0] for call in client.work_info.call_args_list],
+            ["RJ000001", "000001", "RJ000002"],
+        )
+        self.assertCountEqual(
+            [call.args[0] for call in client.tracks.call_args_list],
+            [1, 2],
+        )
+
+    def test_distinct_works_cannot_share_a_sanitized_output_root(self) -> None:
+        works = [
+            {"id": 1, "source_id": "A/B", "title": "title"},
+            {"id": 2, "source_id": "A:B", "title": "title"},
+        ]
+        self.assertEqual(
+            asmr_one.work_folder_name(works[0]),
+            asmr_one.work_folder_name(works[1]),
+        )
+        client = MagicMock()
+        client.tracks.return_value = []
+        with tempfile.TemporaryDirectory() as tmp, patch("asmr_one.log"):
+            summary = asmr_one.DownloadCoordinator(
+                client,
+                download_args(tmp, jobs=2, dry_run=True),
+            ).run_direct(works)
+
+        self.assertEqual((summary.works, summary.fail), (2, 1))
+        client.tracks.assert_called_once_with(1)
 
     def test_explicit_rj_and_vj_codes_with_same_number_remain_distinct(self) -> None:
         client = MagicMock()
