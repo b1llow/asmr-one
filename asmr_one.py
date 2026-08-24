@@ -98,6 +98,10 @@ RETRY_DELAYS = (60.0, 5 * 60.0, 30 * 60.0, 4 * 60 * 60.0, 24 * 60 * 60.0)
 MAX_RETRY_AFTER_SECONDS = RETRY_DELAYS[-1]
 MAX_MEDIA_DNS_THREADS = 4
 MAX_MEDIA_ADDRESSES = 16
+FAKEIP_NETWORKS = (
+    ipaddress.ip_network("198.18.0.0/15"),
+    ipaddress.ip_network("fc00::/18"),
+)
 
 _print_lock = threading.Lock()
 _media_dns_slots = threading.BoundedSemaphore(MAX_MEDIA_DNS_THREADS)
@@ -1348,8 +1352,17 @@ def resolve_media_host(
     return resolved or []
 
 
+def is_fakeip_address(
+    address: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> bool:
+    return any(address in network for network in FAKEIP_NETWORKS)
+
+
 def validate_media_url(
-    url: str, *, timeout: float = 30.0
+    url: str,
+    *,
+    timeout: float = 30.0,
+    allow_fakeip: bool = False,
 ) -> ValidatedMediaTarget:
     hostname, port = media_url_destination(url)
 
@@ -1366,7 +1379,11 @@ def validate_media_url(
 
     if not literal_addresses:
         raise RequestTransportError(f"media host {hostname!r} has no IP address")
-    if any(not address.is_global for address in literal_addresses):
+    if any(
+        not address.is_global
+        and not (allow_fakeip and is_fakeip_address(address))
+        for address in literal_addresses
+    ):
         raise PayloadError(f"media URL resolves to a non-public address: {hostname!r}")
     addresses = tuple(
         dict.fromkeys(str(address) for address in literal_addresses)
@@ -1445,15 +1462,26 @@ class PinnedHTTPSConnection(http.client.HTTPSConnection):
 
 
 class PinnedMediaHTTPSHandler(urllib.request.HTTPSHandler):
-    def __init__(self, *, context: ssl.SSLContext, resolution_timeout: float):
+    def __init__(
+        self,
+        *,
+        context: ssl.SSLContext,
+        resolution_timeout: float,
+        allow_fakeip: bool,
+    ):
         super().__init__(context=context)
         self.resolution_timeout = resolution_timeout
+        self.allow_fakeip = allow_fakeip
 
     def https_open(self, req: urllib.request.Request) -> Any:
         url = req.get_full_url()
         target = getattr(req, "_asmr_media_target", None)
         if not isinstance(target, ValidatedMediaTarget) or target.url != url:
-            target = validate_media_url(url, timeout=self.resolution_timeout)
+            target = validate_media_url(
+                url,
+                timeout=self.resolution_timeout,
+                allow_fakeip=self.allow_fakeip,
+            )
             req._asmr_media_target = target
 
         def connection(host: str, **kwargs: Any) -> PinnedHTTPSConnection:
@@ -1588,7 +1616,13 @@ class SameOriginAuthRedirectHandler(CloseOnlyRedirectHandler):
 
 
 class Client:
-    def __init__(self, token: str | None = None, timeout: int = 30):
+    def __init__(
+        self,
+        token: str | None = None,
+        timeout: int = 30,
+        *,
+        allow_fakeip: bool = False,
+    ):
         normalized_token = normalize_bearer_token(token)
         if token is not None and normalized_token is None:
             raise PayloadError(
@@ -1596,6 +1630,7 @@ class Client:
             )
         self.token = normalized_token
         self.timeout = timeout
+        self.allow_fakeip = allow_fakeip
         self.mirror = DEFAULT_MIRRORS[0]
         self._ctx = ssl.create_default_context()
         self._api_opener = urllib.request.build_opener(
@@ -1608,6 +1643,7 @@ class Client:
             PinnedMediaHTTPSHandler(
                 context=self._ctx,
                 resolution_timeout=float(timeout),
+                allow_fakeip=allow_fakeip,
             ),
         )
 
@@ -1665,6 +1701,7 @@ class Client:
             media_target = validate_media_url(
                 raw_url,
                 timeout=float(self.timeout),
+                allow_fakeip=self.allow_fakeip,
             )
             attempts = [(raw_url, None)]
         else:
@@ -3277,17 +3314,25 @@ def cmd_login(args: argparse.Namespace) -> None:
 
         password = getpass.getpass("password: ")
     validate_credentials(name, password)
-    client = Client(timeout=args.timeout)
+    client = Client(**client_options(args))
     token, user = client.login(name, password)
     save_token(token, name=name)
     shown = user.get("name") or user.get("username") or name
     log(f"logged in as {shown}; token saved to {TOKEN_PATH}")
 
 
+def client_options(args: argparse.Namespace) -> dict[str, Any]:
+    options: dict[str, Any] = {"timeout": args.timeout}
+    if getattr(args, "allow_fakeip", False):
+        options["allow_fakeip"] = True
+    return options
+
+
 def require_client(args: argparse.Namespace, *, need_login: bool = True) -> Client:
     token = load_token()
+    options = client_options(args)
     if token or not need_login:
-        return Client(token=token, timeout=args.timeout)
+        return Client(token=token, **options)
 
     name, password = load_env_credentials()
     if not name and not password:
@@ -3296,7 +3341,7 @@ def require_client(args: argparse.Namespace, *, need_login: bool = True) -> Clie
         die("automatic login requires both ASMR_NAME and ASMR_PASSWORD")
     validate_credentials(name, password)
 
-    client = Client(timeout=args.timeout)
+    client = Client(**options)
     token, _ = client.login(name, password)
     client.token = token
     return client
@@ -4258,6 +4303,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument("--timeout", type=positive_int, default=30)
+    p.add_argument(
+        "--allow-fakeip",
+        action="store_true",
+        help=(
+            "allow common FakeIP DNS ranges when validating network targets; "
+            "literal and other private IPs remain blocked"
+        ),
+    )
     sub = p.add_subparsers(dest="cmd", required=True)
 
     login = sub.add_parser(

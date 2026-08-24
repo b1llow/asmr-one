@@ -674,6 +674,21 @@ class AuthTests(unittest.TestCase):
             client_class.return_value.login.assert_not_called()
             self.assertIs(result, client_class.return_value)
 
+    def test_require_client_propagates_allow_fakeip(self) -> None:
+        args = argparse.Namespace(timeout=7, allow_fakeip=True)
+        with (
+            patch("asmr_one.load_token", return_value=None),
+            patch("asmr_one.Client") as client_class,
+        ):
+            result = require_client(args, need_login=False)
+
+        client_class.assert_called_once_with(
+            token=None,
+            timeout=7,
+            allow_fakeip=True,
+        )
+        self.assertIs(result, client_class.return_value)
+
     def test_explicit_login_still_saves_token(self) -> None:
         args = argparse.Namespace(name="alice1", password="secret1", timeout=15)
         with (
@@ -692,6 +707,31 @@ class AuthTests(unittest.TestCase):
             client_class.assert_called_once_with(timeout=15)
             client_class.return_value.login.assert_called_once_with("alice1", "secret1")
             save_token.assert_called_once_with("fresh-token", name="alice1")
+
+    def test_login_propagates_allow_fakeip(self) -> None:
+        args = argparse.Namespace(
+            name="alice1",
+            password="secret1",
+            timeout=15,
+            allow_fakeip=True,
+        )
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("asmr_one.Client") as client_class,
+            patch("asmr_one.save_token"),
+            patch("asmr_one.log"),
+        ):
+            client_class.return_value.login.return_value = (
+                "fresh-token",
+                {"name": "alice1"},
+            )
+
+            cmd_login(args)
+
+        client_class.assert_called_once_with(
+            timeout=15,
+            allow_fakeip=True,
+        )
 
 
 class ClientTests(unittest.TestCase):
@@ -1362,6 +1402,106 @@ class ClientTests(unittest.TestCase):
                 {},
                 "https://127.0.0.1/private",
             )
+
+    def test_media_urls_allow_common_fakeip_ranges_only_when_enabled(self) -> None:
+        cases = (
+            (asmr_one.socket.AF_INET, "198.18.0.1"),
+            (asmr_one.socket.AF_INET, "198.19.255.254"),
+            (asmr_one.socket.AF_INET6, "fc00::1"),
+        )
+        for family, address in cases:
+            resolution = [
+                (
+                    family,
+                    asmr_one.socket.SOCK_STREAM,
+                    6,
+                    "",
+                    (address, 443),
+                )
+            ]
+            with (
+                self.subTest(address=address, enabled=False),
+                patch("asmr_one.socket.getaddrinfo", return_value=resolution),
+                self.assertRaises(asmr_one.PayloadError),
+            ):
+                asmr_one.validate_media_url("https://cdn.example/file")
+            with (
+                self.subTest(address=address, enabled=True),
+                patch("asmr_one.socket.getaddrinfo", return_value=resolution),
+            ):
+                target = asmr_one.validate_media_url(
+                    "https://cdn.example/file",
+                    allow_fakeip=True,
+                )
+            self.assertEqual(target.addresses, (address,))
+
+    def test_allow_fakeip_keeps_literal_and_other_private_ips_blocked(self) -> None:
+        client = asmr_one.Client(allow_fakeip=True)
+        for url in (
+            "https://198.18.0.1/file",
+            "https://[fc00::1]/file",
+        ):
+            with (
+                self.subTest(url=url),
+                patch.object(client, "_open_request") as open_request,
+                self.assertRaises(asmr_one.PayloadError),
+            ):
+                client.request("GET", "", raw_url=url, stream=True)
+            open_request.assert_not_called()
+
+        mixed_resolution = [
+            (
+                asmr_one.socket.AF_INET,
+                asmr_one.socket.SOCK_STREAM,
+                6,
+                "",
+                ("198.18.0.1", 443),
+            ),
+            (
+                asmr_one.socket.AF_INET,
+                asmr_one.socket.SOCK_STREAM,
+                6,
+                "",
+                ("10.0.0.1", 443),
+            ),
+        ]
+        with (
+            patch(
+                "asmr_one.socket.getaddrinfo",
+                return_value=mixed_resolution,
+            ),
+            self.assertRaises(asmr_one.PayloadError),
+        ):
+            asmr_one.validate_media_url(
+                "https://cdn.example/file",
+                allow_fakeip=True,
+            )
+
+    def test_client_uses_allow_fakeip_for_media_validation(self) -> None:
+        client = asmr_one.Client(allow_fakeip=True)
+        response = FakeResponse(b"data")
+        resolution = [
+            (
+                asmr_one.socket.AF_INET,
+                asmr_one.socket.SOCK_STREAM,
+                6,
+                "",
+                ("198.18.0.8", 443),
+            )
+        ]
+        with (
+            patch("asmr_one.socket.getaddrinfo", return_value=resolution),
+            patch.object(client, "_open_request", return_value=response),
+        ):
+            status, returned = client.request(
+                "GET",
+                "",
+                raw_url="https://cdn.example/file",
+                stream=True,
+            )
+
+        self.assertEqual(status, 200)
+        self.assertIs(returned, response)
 
     def test_media_connection_uses_pinned_ip_and_original_tls_hostname(self) -> None:
         raw_socket = MagicMock()
@@ -3456,6 +3596,17 @@ class ChecksumTests(unittest.TestCase):
             ["download", "--verify", "--work", "RJ1"]
         )
         self.assertTrue(args.verify)
+
+    def test_download_parser_supports_allow_fakeip(self) -> None:
+        enabled = asmr_one.build_parser().parse_args(
+            ["--allow-fakeip", "download", "--work", "RJ1"]
+        )
+        disabled = asmr_one.build_parser().parse_args(
+            ["download", "--work", "RJ1"]
+        )
+
+        self.assertTrue(enabled.allow_fakeip)
+        self.assertFalse(disabled.allow_fakeip)
 
 
 class GlobalTaskSchedulerTests(unittest.TestCase):

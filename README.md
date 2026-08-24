@@ -34,6 +34,8 @@ ASMR_NAME=... ASMR_PASSWORD=... ./asmr_one.py download --out ~/Music/asmr.one
 ./asmr_one.py download --dry-run --limit 3
 ./asmr_one.py download --verify --playlist liked
 ./asmr_one.py download --work RJ01657200
+# when a TUN proxy uses FakeIP/FakeDNS
+./asmr_one.py --allow-fakeip download
 ```
 
 By default, `list` and `download` combine every playlist shown by the site's
@@ -103,7 +105,10 @@ neither files nor locks.
 
 Media downloads require credential-free HTTPS URLs. DNS resolution is bounded by
 `--timeout`, every returned address must be public, and the connection is pinned
-to a validated address while TLS still verifies the original hostname.
+to a validated address while TLS still verifies the original hostname. TUN
+proxies using FakeIP/FakeDNS can opt in with global `--allow-fakeip`; this only
+permits the common `198.18.0.0/15` and `fc00::/18` synthetic ranges for resolved
+hostnames. Literal IP URLs and other non-public addresses remain blocked.
 
 Filters (opt-in):
 
