@@ -850,6 +850,39 @@ def internal_work_id_identity(value: Any) -> str | None:
     return normalized
 
 
+def work_identity_aliases(work: Mapping[str, Any]) -> set[tuple[str, str]]:
+    aliases: set[tuple[str, str]] = set()
+    internal_id = internal_work_id_identity(work.get("id"))
+    if internal_id is not None:
+        aliases.add(("id", internal_id))
+    source_id = work.get("source_id")
+    if is_usable_identifier(source_id):
+        aliases.add(("source_id", explicit_work_code_identity(source_id)))
+    if not aliases:
+        aliases.add(
+            (
+                "payload",
+                json.dumps(
+                    work,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                ),
+            )
+        )
+    return aliases
+
+
+def remember_work_aliases(
+    work: Mapping[str, Any],
+    seen: set[tuple[str, str]],
+) -> bool:
+    aliases = work_identity_aliases(work)
+    is_new = aliases.isdisjoint(seen)
+    seen.update(aliases)
+    return is_new
+
+
 def work_lookup_component(value: Any) -> str:
     raw = str(value).strip()
     if not raw:
@@ -1424,7 +1457,51 @@ class PinnedMediaHTTPSHandler(urllib.request.HTTPSHandler):
     https_request = urllib.request.AbstractHTTPHandler.do_request_
 
 
-class SafeMediaRedirectHandler(urllib.request.HTTPRedirectHandler):
+class ClosedRedirectResponse:
+    """Prevent urllib's redirect handler from draining an untrusted body."""
+
+    def __init__(self, response: Any):
+        self._response = response
+        self._closed = False
+        self.close()
+
+    def read(self, _amount: int = -1) -> bytes:
+        return b""
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._response.close()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._response, name)
+
+
+class CloseOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def http_error_302(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Mapping[str, str],
+    ) -> Any:
+        return super().http_error_302(
+            req,
+            ClosedRedirectResponse(fp),
+            code,
+            msg,
+            headers,
+        )
+
+    http_error_301 = http_error_302
+    http_error_303 = http_error_302
+    http_error_307 = http_error_302
+    http_error_308 = http_error_302
+
+
+class SafeMediaRedirectHandler(CloseOnlyRedirectHandler):
     def redirect_request(
         self,
         req: urllib.request.Request,
@@ -1445,7 +1522,11 @@ def url_origin(url: str) -> tuple[str, str, int] | None:
         if scheme not in {"http", "https"}:
             return None
         hostname = parsed.hostname
-        if hostname is None:
+        if (
+            hostname is None
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
             return None
         default_port = 443 if scheme == "https" else 80
         port = parsed.port or default_port
@@ -1454,7 +1535,7 @@ def url_origin(url: str) -> tuple[str, str, int] | None:
     return scheme, hostname.rstrip(".").casefold(), port
 
 
-class SameOriginAuthRedirectHandler(urllib.request.HTTPRedirectHandler):
+class SameOriginAuthRedirectHandler(CloseOnlyRedirectHandler):
     def redirect_request(
         self,
         req: urllib.request.Request,
@@ -1464,6 +1545,14 @@ class SameOriginAuthRedirectHandler(urllib.request.HTTPRedirectHandler):
         headers: Mapping[str, str],
         newurl: str,
     ) -> urllib.request.Request | None:
+        source_origin = url_origin(req.full_url)
+        destination_origin = url_origin(newurl)
+        if (
+            source_origin is None
+            or source_origin[0] != "https"
+            or destination_origin != source_origin
+        ):
+            raise PayloadError(f"unsafe API redirect destination: {newurl!r}")
         redirected = super().redirect_request(
             req,
             fp,
@@ -1472,12 +1561,7 @@ class SameOriginAuthRedirectHandler(urllib.request.HTTPRedirectHandler):
             headers,
             newurl,
         )
-        source_origin = url_origin(req.full_url)
-        if (
-            redirected is None
-            or source_origin is None
-            or source_origin != url_origin(newurl)
-        ):
+        if redirected is None:
             return redirected
         authorization = next(
             (
@@ -1964,9 +2048,7 @@ class Client:
                 for work in self.iter_playlist_works(
                     str(playlist_id), page_size=page_size
                 ):
-                    key = work_identity(work)
-                    if key not in seen:
-                        seen.add(key)
+                    if remember_work_aliases(work, seen):
                         yield work
             return
         if source != "review":
@@ -2192,7 +2274,10 @@ def strong_etag(headers: Mapping[str, Any]) -> str | None:
     if value is None:
         return None
     etag = str(value).strip()
-    if not etag or etag.casefold().startswith("w/"):
+    if (
+        etag.casefold().startswith("w/")
+        or re.fullmatch(r'"[\x21\x23-\x7e\x80-\xff]*"', etag) is None
+    ):
         return None
     return etag
 
@@ -3217,10 +3302,8 @@ def collect_playlist_works(
         if playlist_id is None:
             raise PayloadError("playlist is missing its id")
         for work in client.iter_playlist_works(str(playlist_id), page_size=page_size):
-            key = work_identity(work)
-            if key in seen:
+            if not remember_work_aliases(work, seen):
                 continue
-            seen.add(key)
             works.append(work)
             if limit is not None and len(works) >= limit:
                 return works
@@ -3238,10 +3321,8 @@ def collect_works(client: Client, args: argparse.Namespace) -> list[dict[str, An
                 continue
             seen_codes.add(code_identity)
             work = client.work_info(code)
-            identity = work_identity(work)
-            if identity in seen_works:
+            if not remember_work_aliases(work, seen_works):
                 continue
-            seen_works.add(identity)
             works.append(work)
             if args.limit is not None and len(works) >= args.limit:
                 break
@@ -3254,10 +3335,8 @@ def collect_works(client: Client, args: argparse.Namespace) -> list[dict[str, An
         works = []
         seen: set[tuple[str, str]] = set()
         for work in client.iter_collection("review", page_size=args.page_size):
-            key = work_identity(work)
-            if key in seen:
+            if not remember_work_aliases(work, seen):
                 continue
-            seen.add(key)
             works.append(work)
             if args.limit is not None and len(works) >= args.limit:
                 break
@@ -3640,10 +3719,8 @@ class DownloadCoordinator:
         if self.discovery_stopped and apply_limit:
             return
         limit = getattr(self.args, "limit", None)
-        identity = work_identity(work)
-        if identity in self.seen_works:
+        if not remember_work_aliases(work, self.seen_works):
             return
-        self.seen_works.add(identity)
         if apply_limit and limit and self.admitted_works >= limit:
             self.deferred_works.append(work)
             return

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import email.message
 import io
 import json
 import os
@@ -807,16 +808,71 @@ class ClientTests(unittest.TestCase):
             same_origin.get_header("Authorization"),
             "Bearer secret",
         )
-        cross_origin = handler.redirect_request(
-            api_request,
-            None,
-            302,
-            "Found",
-            {},
+        for destination in (
             "https://cdn.example/redirected",
+            "http://api.example/redirected",
+            "https://127.0.0.1/private",
+            "https://user@api.example/private",
+        ):
+            with self.subTest(destination=destination), self.assertRaises(
+                asmr_one.PayloadError
+            ):
+                handler.redirect_request(
+                    api_request,
+                    None,
+                    302,
+                    "Found",
+                    {},
+                    destination,
+                )
+
+    def test_redirect_handlers_close_bodies_without_reading_them(self) -> None:
+        class RedirectResponse:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def read(self, _amount: int = -1) -> bytes:
+                raise AssertionError("redirect body was read")
+
+            def close(self) -> None:
+                self.closed = True
+
+        cases = (
+            (
+                asmr_one.SafeMediaRedirectHandler(),
+                "https://cdn.example/original",
+                "https://cdn.example/redirected",
+            ),
+            (
+                asmr_one.SameOriginAuthRedirectHandler(),
+                "https://api.example/original",
+                "https://api.example/redirected",
+            ),
         )
-        self.assertIsNotNone(cross_origin)
-        self.assertIsNone(cross_origin.get_header("Authorization"))
+        for handler, source, destination in cases:
+            with self.subTest(handler=type(handler).__name__):
+                parent = MagicMock()
+                result = object()
+                parent.open.return_value = result
+                handler.add_parent(parent)
+                request = asmr_one.urllib.request.Request(source)
+                request.timeout = 30
+                response = RedirectResponse()
+                headers = email.message.Message()
+                headers["Location"] = destination
+
+                self.assertIs(
+                    handler.http_error_302(
+                        request,
+                        response,
+                        302,
+                        "Found",
+                        headers,
+                    ),
+                    result,
+                )
+                self.assertTrue(response.closed)
+                parent.open.assert_called_once()
 
     def test_successful_fallback_mirror_is_promoted(self) -> None:
         mirrors = ("https://preferred.example", "https://fallback.example")
@@ -1586,8 +1642,11 @@ class PlaylistTests(unittest.TestCase):
         client = MagicMock()
         client.iter_playlists.return_value = iter([{"id": "p1"}, {"id": "p2"}])
         playlist_works = {
-            "p1": [{"id": 1}, {"id": 2}],
-            "p2": [{"id": 2}, {"id": 3}],
+            "p1": [
+                {"id": 1, "source_id": "RJ000001"},
+                {"id": 2},
+            ],
+            "p2": [{"source_id": "rj1"}, {"id": 2}, {"id": 3}],
         }
         client.iter_playlist_works.side_effect = lambda playlist_id, *, page_size: iter(
             playlist_works[playlist_id]
@@ -1641,8 +1700,8 @@ class PlaylistTests(unittest.TestCase):
         client = MagicMock()
 
         def review_works() -> Any:
-            yield {"id": 1}
-            yield {"id": 1}
+            yield {"id": 1, "source_id": "RJ000001"}
+            yield {"source_id": "rj1"}
             yield {"id": 2}
             self.fail("limit advanced past the requested unique works")
 
@@ -2998,6 +3057,23 @@ class ChecksumTests(unittest.TestCase):
                 client.request.call_args.kwargs["headers"],
                 {"If-Range": '"version-one"'},
             )
+
+    def test_only_quoted_strong_etags_are_resume_validators(self) -> None:
+        for value in (
+            "stable",
+            'W/"stable"',
+            '"unterminated',
+            '"bad"tail',
+            '"bad\x00tag"',
+            '"bad\"tag"',
+            "\u2603",
+        ):
+            with self.subTest(value=value):
+                self.assertIsNone(asmr_one.strong_etag({"ETag": value}))
+
+        for value in ('""', '"stable"', '"slash\\allowed"'):
+            with self.subTest(value=value):
+                self.assertEqual(asmr_one.strong_etag({"ETag": value}), value)
 
     def test_changed_etag_restarts_from_zero(self) -> None:
         client = MagicMock()
