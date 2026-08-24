@@ -428,6 +428,41 @@ class AuthTests(unittest.TestCase):
             ):
                 self.assertEqual(asmr_one.load_token(), "saved-token")
 
+    def test_whitespace_environment_token_falls_back_to_saved_token(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            token_path = Path(tmp) / "token.json"
+            token_path.write_text('{"token": "saved-token"}', encoding="utf-8")
+            with (
+                patch.object(asmr_one, "TOKEN_PATH", token_path),
+                patch.dict(os.environ, {"ASMR_TOKEN": "   "}, clear=True),
+            ):
+                self.assertEqual(asmr_one.load_token(), "saved-token")
+
+    def test_saved_token_is_atomically_installed_with_mode_0600(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config"
+            token_path = config / "token.json"
+            installed_modes: list[int] = []
+            real_replace = os.replace
+
+            def replace(source: str | Path, destination: str | Path) -> None:
+                installed_modes.append(Path(source).stat().st_mode & 0o777)
+                real_replace(source, destination)
+
+            with (
+                patch.object(asmr_one, "CONFIG_DIR", config),
+                patch.object(asmr_one, "TOKEN_PATH", token_path),
+                patch("asmr_one.os.replace", side_effect=replace),
+            ):
+                asmr_one.save_token("secret", name="alice")
+
+            self.assertEqual(installed_modes, [0o600])
+            self.assertEqual(token_path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(
+                json.loads(token_path.read_text(encoding="utf-8")),
+                {"name": "alice", "token": "secret"},
+            )
+
     def test_non_object_saved_token_is_ignored(self) -> None:
         for payload in ("null", "[]", '"token"'):
             with (
@@ -566,6 +601,19 @@ class ClientTests(unittest.TestCase):
 
         self.assertEqual(token, "valid")
         self.assertEqual(client.token, "valid")
+
+    def test_whoami_rejects_non_object_success_payloads(self) -> None:
+        client = asmr_one.Client()
+        for payload in (None, [], b"not-json"):
+            with (
+                self.subTest(payload=payload),
+                patch.object(client, "request", return_value=(200, payload)),
+                self.assertRaises(asmr_one.PayloadError) as raised,
+            ):
+                client.whoami()
+            self.assertFalse(
+                asmr_one.is_retryable_network_error(raised.exception)
+            )
 
     def test_bearer_token_is_limited_to_the_api_request(self) -> None:
         requests: list[asmr_one.urllib.request.Request] = []
@@ -903,6 +951,18 @@ class PlaylistTests(unittest.TestCase):
                 ),
             ),
             (
+                {"playlists": [{}]},
+                lambda: client.playlists_page(
+                    filter_by="all", page=1, page_size=2
+                ),
+            ),
+            (
+                {"playlists": [{"id": ""}]},
+                lambda: client.playlists_page(
+                    filter_by="all", page=1, page_size=2
+                ),
+            ),
+            (
                 {"works": [{"id": 1}, None]},
                 lambda: client.playlist_works_page(
                     "playlist-id", page=1, page_size=2
@@ -951,6 +1011,37 @@ class PlaylistTests(unittest.TestCase):
             works=None,
             source="auto",
             page_size=2,
+            limit=None,
+            playlist_selectors=None,
+        )
+
+        with patch("asmr_one.log"):
+            works = asmr_one.collect_works(client, args)
+
+        self.assertEqual([work["id"] for work in works], [1, 2, 3])
+        client.iter_playlists.assert_called_once_with(filter_by="all", page_size=2)
+        self.assertEqual(
+            [call.args[0] for call in client.iter_playlist_works.call_args_list],
+            ["p1", "p2"],
+        )
+
+    def test_collection_limit_stops_fetching_after_unique_works(self) -> None:
+        client = MagicMock()
+
+        def playlists() -> Any:
+            yield {"id": "p1"}
+            self.fail("limit advanced the playlist listing")
+
+        client.iter_playlists.return_value = playlists()
+        client.iter_playlist_works.side_effect = lambda playlist_id, *, page_size: iter(
+            [{"id": 1}, {"id": 1}, {"id": 2}]
+            if playlist_id == "p1"
+            else self.fail("limit fetched a later playlist")
+        )
+        args = argparse.Namespace(
+            works=None,
+            source="auto",
+            page_size=2,
             limit=2,
             playlist_selectors=None,
         )
@@ -959,11 +1050,29 @@ class PlaylistTests(unittest.TestCase):
             works = asmr_one.collect_works(client, args)
 
         self.assertEqual([work["id"] for work in works], [1, 2])
-        client.iter_playlists.assert_called_once_with(filter_by="all", page_size=2)
-        self.assertEqual(
-            [call.args[0] for call in client.iter_playlist_works.call_args_list],
-            ["p1", "p2"],
+        client.iter_playlist_works.assert_called_once_with("p1", page_size=2)
+
+    def test_review_limit_stops_collection_iteration(self) -> None:
+        client = MagicMock()
+
+        def review_works() -> Any:
+            yield {"id": 1}
+            yield {"id": 1}
+            yield {"id": 2}
+            self.fail("limit advanced past the requested unique works")
+
+        client.iter_collection.return_value = review_works()
+        args = argparse.Namespace(
+            works=None,
+            source="review",
+            page_size=2,
+            limit=2,
+            playlist_selectors=None,
         )
+
+        works = asmr_one.collect_works(client, args)
+
+        self.assertEqual([work["id"] for work in works], [1, 2])
 
     def test_playlist_sources_do_not_fall_back_to_review(self) -> None:
         args = argparse.Namespace(

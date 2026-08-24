@@ -29,7 +29,7 @@ from collections import deque
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping
+from typing import Any, Callable, Iterable, Iterator, Mapping
 
 from blake3 import blake3
 
@@ -613,8 +613,10 @@ def config_dir() -> Path:
 
 def load_token() -> str | None:
     env = os.environ.get("ASMR_TOKEN")
-    if env:
-        return env.strip()
+    if env is not None:
+        normalized = env.strip()
+        if normalized:
+            return normalized
     if not TOKEN_PATH.is_file():
         return None
     try:
@@ -632,10 +634,7 @@ def save_token(token: str, name: str | None = None) -> None:
     payload = {"token": token}
     if name:
         payload["name"] = name
-    TOKEN_PATH.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
-    os.chmod(TOKEN_PATH, 0o600)
+    save_json_atomic(TOKEN_PATH, payload, prefix=".token.")
 
 
 def load_env_credentials() -> tuple[str | None, str | None]:
@@ -698,7 +697,7 @@ def select_playlists(
     return selected
 
 
-def is_usable_work_identifier(value: Any) -> bool:
+def is_usable_identifier(value: Any) -> bool:
     return (isinstance(value, str) and bool(value.strip())) or (
         isinstance(value, int) and not isinstance(value, bool)
     )
@@ -707,7 +706,7 @@ def is_usable_work_identifier(value: Any) -> bool:
 def work_identity(work: dict[str, Any]) -> tuple[str, str]:
     for key in ("id", "source_id"):
         value = work.get(key)
-        if is_usable_work_identifier(value):
+        if is_usable_identifier(value):
             normalized = value.strip() if isinstance(value, str) else str(value)
             return key, normalized
     return "payload", json.dumps(work, ensure_ascii=False, sort_keys=True, default=str)
@@ -715,7 +714,7 @@ def work_identity(work: dict[str, Any]) -> tuple[str, str]:
 
 def has_usable_work_identity(work: Mapping[str, Any]) -> bool:
     return any(
-        is_usable_work_identifier(work.get(key)) for key in ("id", "source_id")
+        is_usable_identifier(work.get(key)) for key in ("id", "source_id")
     )
 
 
@@ -1161,7 +1160,9 @@ class Client:
 
     def whoami(self) -> dict[str, Any]:
         _, payload = self.request("GET", "/api/auth/me")
-        return payload if isinstance(payload, dict) else {"raw": payload}
+        if not isinstance(payload, dict):
+            raise PayloadError(f"unexpected whoami payload: {payload!r}")
+        return payload
 
     def work_info(self, work_id: str | int) -> dict[str, Any]:
         lookup = re.sub(r"^(?:RJ|VJ)0*", "", str(work_id), flags=re.IGNORECASE)
@@ -1263,6 +1264,9 @@ class Client:
             )
             raise PayloadError(f"unexpected playlists shape: {keys}")
         playlists = object_items(payload["playlists"], "playlist")
+        for index, playlist in enumerate(playlists):
+            if not is_usable_identifier(playlist.get("id")):
+                raise PayloadError(f"playlist entry {index} has no usable id")
         return self._fetched_page(payload, playlists, page=page, page_size=page_size)
 
     def playlist_works_page(
@@ -2412,7 +2416,11 @@ def require_client(args: argparse.Namespace, *, need_login: bool = True) -> Clie
 
 
 def collect_playlist_works(
-    client: Client, playlists: list[dict[str, Any]], *, page_size: int
+    client: Client,
+    playlists: Iterable[dict[str, Any]],
+    *,
+    page_size: int,
+    limit: int | None = None,
 ) -> list[dict[str, Any]]:
     works: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
@@ -2426,6 +2434,8 @@ def collect_playlist_works(
                 continue
             seen.add(key)
             works.append(work)
+            if limit is not None and len(works) >= limit:
+                return works
     return works
 
 
@@ -2438,16 +2448,34 @@ def collect_works(client: Client, args: argparse.Namespace) -> list[dict[str, An
     if args.source == "review":
         if selectors:
             die("--playlist cannot be used with --source review")
-        works = list(client.iter_collection("review", page_size=args.page_size))
+        works = []
+        seen: set[tuple[str, str]] = set()
+        for work in client.iter_collection("review", page_size=args.page_size):
+            key = work_identity(work)
+            if key in seen:
+                continue
+            seen.add(key)
+            works.append(work)
+            if args.limit is not None and len(works) >= args.limit:
+                break
     else:
-        playlists = list(
-            client.iter_playlists(filter_by="all", page_size=args.page_size)
+        playlist_iter = client.iter_playlists(
+            filter_by="all", page_size=args.page_size
         )
-        playlists = select_playlists(playlists, selectors)
-        log(f"{len(playlists)} playlists selected")
-        works = collect_playlist_works(client, playlists, page_size=args.page_size)
-    if args.limit:
-        works = works[: args.limit]
+        if selectors or args.limit is None:
+            playlists: Iterable[dict[str, Any]] = select_playlists(
+                list(playlist_iter), selectors
+            )
+            log(f"{len(playlists)} playlists selected")
+        else:
+            playlists = playlist_iter
+            log("all playlists selected (bounded by work limit)")
+        works = collect_playlist_works(
+            client,
+            playlists,
+            page_size=args.page_size,
+            limit=args.limit,
+        )
     return works
 
 
@@ -2475,7 +2503,7 @@ def cmd_list(args: argparse.Namespace) -> None:
     log(f"{len(works)} works")
     for work in works:
         source_value = work.get("source_id")
-        if not is_usable_work_identifier(source_value):
+        if not is_usable_identifier(source_value):
             source_value = work.get("id")
         source = single_line_text(source_value)
         title = single_line_text(work.get("title"))
