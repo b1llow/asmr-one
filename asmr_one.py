@@ -264,6 +264,34 @@ def die(msg: str, code: int = 1) -> None:
     raise SystemExit(code)
 
 
+def ensure_safe_work_directory(root: Path, directory: Path) -> None:
+    try:
+        relative = directory.relative_to(root)
+    except ValueError as exc:
+        raise LocalStateError(
+            f"download directory escapes work root: {directory}"
+        ) from exc
+    if any(part in {"", ".", ".."} for part in relative.parts):
+        raise LocalStateError(f"unsafe download directory: {directory}")
+    if root.is_symlink():
+        raise LocalStateError(f"work directory must not be a symlink: {root}")
+    root.mkdir(parents=True, exist_ok=True)
+    if root.is_symlink() or not root.is_dir():
+        raise LocalStateError(f"work directory is not a real directory: {root}")
+    current = root
+    for part in relative.parts:
+        current /= part
+        if current.is_symlink():
+            raise LocalStateError(
+                f"download directory must not be a symlink: {current}"
+            )
+        current.mkdir(exist_ok=True)
+        if current.is_symlink() or not current.is_dir():
+            raise LocalStateError(
+                f"download path is not a real directory: {current}"
+            )
+
+
 class WorkLock:
     def __init__(self, path: Path, fd: int):
         self.path = path
@@ -271,7 +299,7 @@ class WorkLock:
 
     @classmethod
     def acquire(cls, root: Path) -> WorkLock:
-        root.mkdir(parents=True, exist_ok=True)
+        ensure_safe_work_directory(root, root)
         path = root / WORK_LOCK_FILE_NAME
         flags = os.O_RDWR | os.O_CREAT
         if hasattr(os, "O_CLOEXEC"):
@@ -593,6 +621,8 @@ def load_token() -> str | None:
         data = json.loads(TOKEN_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+    if not isinstance(data, dict):
+        return None
     token = data.get("token")
     return token.strip() if isinstance(token, str) and token.strip() else None
 
@@ -689,21 +719,38 @@ def work_folder_name(work: dict[str, Any]) -> str:
     return sanitize(f"{source} {title}", max_bytes=MAX_WORK_FOLDER_BYTES)
 
 
+def first_list_container(
+    payload: Mapping[str, Any], keys: tuple[str, ...]
+) -> list[Any] | None:
+    empty: list[Any] | None = None
+    for key in keys:
+        candidate = payload.get(key)
+        if not isinstance(candidate, list):
+            continue
+        if candidate:
+            return candidate
+        if empty is None:
+            empty = candidate
+    return empty
+
+
 def flatten_tracks(nodes: Any, prefix: tuple[str, ...] = ()) -> list[dict[str, Any]]:
     files: list[dict[str, Any]] = []
     if isinstance(nodes, dict):
-        nodes = nodes.get("children") or nodes.get("tracks") or nodes.get("files") or []
+        nodes = first_list_container(nodes, ("children", "tracks", "files"))
     if not isinstance(nodes, list):
-        return files
-    for node in nodes:
+        raise PayloadError("track payload has no list container")
+    for index, node in enumerate(nodes):
         if not isinstance(node, dict):
-            continue
+            raise PayloadError(f"track entry {index} is not an object")
         title = str(node.get("title") or "file")
         children = node.get("children")
         if node.get("type") == "folder" or (
-            children and "mediaDownloadUrl" not in node
+            children is not None and "mediaDownloadUrl" not in node
         ):
-            files.extend(flatten_tracks(children or [], prefix + (title,)))
+            if not isinstance(children, list):
+                raise PayloadError(f"track folder {title!r} has invalid children")
+            files.extend(flatten_tracks(children, prefix + (title,)))
             continue
         url = node.get("mediaDownloadUrl") or node.get("mediaStreamUrl")
         if not url:
@@ -723,6 +770,26 @@ def flatten_tracks(nodes: Any, prefix: tuple[str, ...] = ()) -> list[dict[str, A
             }
         )
     return files
+
+
+def object_items(items: list[Any], label: str) -> list[dict[str, Any]]:
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise PayloadError(f"{label} entry {index} is not an object")
+    return items
+
+
+def work_items(items: list[Any], label: str) -> list[dict[str, Any]]:
+    works: list[dict[str, Any]] = []
+    for index, item in enumerate(object_items(items, label)):
+        if "work" not in item:
+            works.append(item)
+            continue
+        work = item["work"]
+        if not isinstance(work, dict):
+            raise PayloadError(f"{label} entry {index} has invalid work")
+        works.append(work)
+    return works
 
 
 def path_lang_score(parts: tuple[str, ...]) -> int:
@@ -808,6 +875,10 @@ class ApiError(RuntimeError):
         self.retry_after_hint: float | None = None
 
 
+class DownloadAuthorizationError(ApiError):
+    """A raw media URL expired and should be refreshed before retrying."""
+
+
 def bounded_retry_after(seconds: float) -> float | None:
     if not math.isfinite(seconds):
         return None
@@ -844,7 +915,14 @@ def retry_after_seconds(exc: BaseException) -> float | None:
 
 
 def is_retryable_network_error(exc: BaseException) -> bool:
-    if isinstance(exc, (RetryableDownloadError, RequestTransportError)):
+    if isinstance(
+        exc,
+        (
+            RetryableDownloadError,
+            RequestTransportError,
+            DownloadAuthorizationError,
+        ),
+    ):
         return True
     if not isinstance(exc, ApiError):
         return False
@@ -965,7 +1043,12 @@ class Client:
                     continue
                 finally:
                     exc.close()
-                error = ApiError(
+                error_type = (
+                    DownloadAuthorizationError
+                    if raw_url and exc.code in {401, 403}
+                    else ApiError
+                )
+                error = error_type(
                     exc.code,
                     payload,
                     dict(exc.headers.items()) if exc.headers is not None else None,
@@ -1031,19 +1114,10 @@ class Client:
     def tracks(self, work_id: str | int) -> list[dict[str, Any]]:
         lookup = re.sub(r"^(?:RJ|VJ)0*", "", str(work_id), flags=re.IGNORECASE)
         _, payload = self.request("GET", f"/api/tracks/{lookup}?v=2")
-        if isinstance(payload, list):
-            nodes = payload
-        elif isinstance(payload, dict):
-            nodes = None
-            for key in ("children", "tracks", "files"):
-                if key in payload:
-                    nodes = payload[key]
-                    break
-            if not isinstance(nodes, list):
-                raise PayloadError(f"bad tracks payload for {work_id}")
-        else:
-            raise PayloadError(f"bad tracks payload for {work_id}")
-        return flatten_tracks(nodes)
+        try:
+            return flatten_tracks(payload)
+        except PayloadError as exc:
+            raise PayloadError(f"bad tracks payload for {work_id}: {exc}") from exc
 
     def _page(self, path: str, page: int, page_size: int) -> dict[str, Any]:
         qs = urllib.parse.urlencode(
@@ -1129,7 +1203,7 @@ class Client:
                 else type(payload).__name__
             )
             raise PayloadError(f"unexpected playlists shape: {keys}")
-        playlists = [item for item in payload["playlists"] if isinstance(item, dict)]
+        playlists = object_items(payload["playlists"], "playlist")
         return self._fetched_page(payload, playlists, page=page, page_size=page_size)
 
     def playlist_works_page(
@@ -1146,28 +1220,18 @@ class Client:
                 else type(payload).__name__
             )
             raise PayloadError(f"unexpected playlist works shape: {keys}")
-        works = [
-            item.get("work") if isinstance(item.get("work"), dict) else item
-            for item in payload["works"]
-            if isinstance(item, dict)
-        ]
+        works = work_items(payload["works"], "playlist work")
         return self._fetched_page(payload, works, page=page, page_size=page_size)
 
     def review_page(self, *, page: int, page_size: int) -> FetchedPage:
         payload = self._page("/api/review", page, page_size)
-        raw_works = (
-            payload.get("works")
-            or payload.get("items")
-            or payload.get("favorites")
-            or []
+        raw_works = first_list_container(
+            payload,
+            ("works", "items", "favorites"),
         )
-        if not isinstance(raw_works, list):
+        if raw_works is None:
             raise PayloadError(f"unexpected collection shape: {sorted(payload.keys())}")
-        works = [
-            item.get("work") if isinstance(item.get("work"), dict) else item
-            for item in raw_works
-            if isinstance(item, dict)
-        ]
+        works = work_items(raw_works, "review work")
         return self._fetched_page(payload, works, page=page, page_size=page_size)
 
     def iter_playlists(
@@ -1484,7 +1548,7 @@ def save_partial_state(dest: Path, state: PartialState) -> None:
             "committed_blake3": state.committed_blake3,
             "etag": state.etag,
         },
-        prefix=f".{part_state_path(dest).name}.",
+        prefix=".part-state.",
     )
 
 
@@ -1855,6 +1919,16 @@ def stat_signature(value: os.stat_result) -> tuple[int, int, int, int, int]:
     )
 
 
+def require_file_signature(
+    path: Path,
+    expected: tuple[int, int, int, int, int],
+) -> None:
+    if path.is_symlink() or not path.is_file():
+        raise LocalStateError(f"validated partial file disappeared: {path}")
+    if stat_signature(path.stat()) != expected:
+        raise LocalStateError(f"partial file changed before installation: {path}")
+
+
 def open_validated_partial(
     dest: Path,
     remote: dict[str, Any],
@@ -1914,18 +1988,24 @@ def checkpoint_partial(
     hasher: Any,
     remote: dict[str, Any],
     etag: str | None,
-) -> PartialState:
+) -> tuple[PartialState, tuple[int, int, int, int, int]]:
     fh.flush()
     os.fsync(fh.fileno())
+    before = stat_signature(os.fstat(fh.fileno()))
     position = fh.tell()
-    actual_size = os.fstat(fh.fileno()).st_size
+    actual_size = before[2]
     if actual_size != position:
         raise LocalStateError(
             f"partial file size changed while downloading: {part_file_path(dest)}"
         )
     state = PartialState(remote, actual_size, hasher.hexdigest().lower(), etag)
     save_partial_state(dest, state)
-    return state
+    after = stat_signature(os.fstat(fh.fileno()))
+    if before != after:
+        raise LocalStateError(
+            f"partial file changed while checkpointing: {part_file_path(dest)}"
+        )
+    return state, after
 
 
 def validate_range_response(
@@ -1964,10 +2044,12 @@ def download_one(
     resume: bool,
     remote: dict[str, Any],
     checkpoint_size: int = PART_CHECKPOINT_SIZE,
+    work_root: Path | None = None,
 ) -> DownloadResult:
     if checkpoint_size < 1:
         raise ValueError("checkpoint_size must be at least 1")
-    dest.parent.mkdir(parents=True, exist_ok=True)
+    safe_root = work_root or dest.parent
+    ensure_safe_work_directory(safe_root, dest.parent)
     tmp = part_file_path(dest)
     for path in (dest, tmp, part_state_path(dest)):
         if path.is_symlink():
@@ -1991,7 +2073,11 @@ def download_one(
         and has_stable_remote_id
     ):
         digest = hasher.hexdigest()
+        if partial_signature is None:
+            raise LocalStateError(f"validated partial file disappeared: {tmp}")
         partial_fh.close()
+        ensure_safe_work_directory(safe_root, dest.parent)
+        require_file_signature(tmp, partial_signature)
         os.replace(tmp, dest)
         fsync_directory(dest.parent)
         remove_partial_state(dest)
@@ -2165,7 +2251,13 @@ def download_one(
                 raise DownloadProtocolError(
                     f"response body length {received_size} != expected {expected_body_size}"
                 )
-            final_state = checkpoint_partial(dest, fh, hasher, remote, selected_etag)
+            final_state, final_signature = checkpoint_partial(
+                dest,
+                fh,
+                hasher,
+                remote,
+                selected_etag,
+            )
         finally:
             fh.close()
     finally:
@@ -2182,6 +2274,8 @@ def download_one(
         raise DownloadProtocolError(f"size mismatch {final_size} != {effective_size}")
     if dest.is_symlink():
         raise LocalStateError(f"download target must not be a symlink: {dest}")
+    ensure_safe_work_directory(safe_root, dest.parent)
+    require_file_signature(tmp, final_signature)
     os.replace(tmp, dest)
     fsync_directory(dest.parent)
     remove_partial_state(dest)
@@ -2192,6 +2286,8 @@ def download_file_and_record(
     client: Client,
     context: LocalFileContext,
     plan: LocalFilePlan,
+    *,
+    work_root: Path | None = None,
 ) -> DownloadOutcome:
     result = download_one(
         client,
@@ -2200,6 +2296,7 @@ def download_file_and_record(
         expected_file_size(plan.file),
         resume=plan.resume,
         remote=remote_fingerprint(plan.file),
+        work_root=work_root,
     )
     return DownloadOutcome(
         result,
@@ -2396,7 +2493,12 @@ class DownloadOperation:
         if self.calls:
             self._refresh()
         self.calls += 1
-        return download_file_and_record(self.client, self.context, self.plan)
+        return download_file_and_record(
+            self.client,
+            self.context,
+            self.plan,
+            work_root=self.root,
+        )
 
 
 class DownloadCoordinator:
@@ -3112,7 +3214,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="default auto = playlists; favorites is a compatibility alias",
     )
     common.add_argument("--page-size", type=positive_int, default=50)
-    common.add_argument("--limit", type=int)
+    common.add_argument("--limit", type=positive_int)
     collection = common.add_mutually_exclusive_group()
     collection.add_argument(
         "--work",

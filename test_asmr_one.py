@@ -291,6 +291,17 @@ class PathSafetyTests(unittest.TestCase):
         self.assertLessEqual(
             len(asmr_one.part_state_path(relative).name.encode("utf-8")), 255
         )
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / relative.name
+            state = asmr_one.PartialState(
+                asmr_one.remote_fingerprint(remote_file()),
+                0,
+                asmr_one.new_blake3_hasher().hexdigest(),
+            )
+
+            asmr_one.save_partial_state(dest, state)
+
+            self.assertTrue(asmr_one.part_state_path(dest).is_file())
 
 
 class AuthTests(unittest.TestCase):
@@ -313,6 +324,20 @@ class AuthTests(unittest.TestCase):
                 patch.dict(os.environ, {}, clear=True),
             ):
                 self.assertEqual(asmr_one.load_token(), "saved-token")
+
+    def test_non_object_saved_token_is_ignored(self) -> None:
+        for payload in ("null", "[]", '"token"'):
+            with (
+                self.subTest(payload=payload),
+                tempfile.TemporaryDirectory() as tmp,
+            ):
+                token_path = Path(tmp) / "token.json"
+                token_path.write_text(payload, encoding="utf-8")
+                with (
+                    patch.object(asmr_one, "TOKEN_PATH", token_path),
+                    patch.dict(os.environ, {}, clear=True),
+                ):
+                    self.assertIsNone(asmr_one.load_token())
 
     def test_require_client_auto_logs_in_from_environment(self) -> None:
         args = argparse.Namespace(timeout=12)
@@ -487,7 +512,15 @@ class ClientTests(unittest.TestCase):
 
     def test_tracks_rejects_malformed_success_payloads(self) -> None:
         client = asmr_one.Client()
-        for payload in (None, "bad", {}, {"error": "bad"}, {"tracks": None}):
+        for payload in (
+            None,
+            "bad",
+            {},
+            {"error": "bad"},
+            {"tracks": None},
+            [None],
+            {"tracks": [None]},
+        ):
             with (
                 self.subTest(payload=payload),
                 patch.object(client, "request", return_value=(200, payload)),
@@ -498,6 +531,54 @@ class ClientTests(unittest.TestCase):
 
         with patch.object(client, "request", return_value=(200, {"tracks": []})):
             self.assertEqual(client.tracks("RJ1"), [])
+
+    def test_tracks_uses_later_nonempty_container(self) -> None:
+        node = {
+            "title": "track.wav",
+            "mediaDownloadUrl": "https://cdn.example/track.wav",
+            "size": 5,
+            "hash": "work/track",
+            "type": "audio",
+        }
+        client = asmr_one.Client()
+        for children in (None, []):
+            payload = {"children": children, "tracks": [node]}
+            with (
+                self.subTest(children=children),
+                patch.object(client, "request", return_value=(200, payload)),
+            ):
+                tracks = client.tracks("RJ1")
+
+            self.assertEqual(len(tracks), 1)
+            self.assertEqual(tracks[0]["title"], "track.wav")
+
+    def test_raw_auth_error_is_refreshable_but_api_auth_error_is_not(self) -> None:
+        forbidden = asmr_one.urllib.error.HTTPError(
+            "https://cdn.example/expired",
+            403,
+            "forbidden",
+            {},
+            io.BytesIO(b"expired"),
+        )
+        with patch(
+            "asmr_one.urllib.request.urlopen",
+            side_effect=forbidden,
+        ):
+            client = asmr_one.Client()
+            with self.assertRaises(
+                asmr_one.DownloadAuthorizationError
+            ) as raised:
+                client.request(
+                    "GET",
+                    "",
+                    raw_url="https://cdn.example/expired",
+                    stream=True,
+                )
+
+        self.assertTrue(asmr_one.is_retryable_network_error(raised.exception))
+        self.assertFalse(
+            asmr_one.is_retryable_network_error(ApiError(403, "forbidden"))
+        )
 
     def test_incomplete_json_response_becomes_retryable_transport_error(self) -> None:
         client = asmr_one.Client()
@@ -623,6 +704,40 @@ class PlaylistTests(unittest.TestCase):
         self.assertIn(
             "id=playlist-id&page=2&pageSize=2", request.call_args_list[1].args[1]
         )
+
+    def test_pages_reject_malformed_entries_before_counting(self) -> None:
+        client = asmr_one.Client()
+        cases = (
+            (
+                {"playlists": [{"id": "p1"}, None]},
+                lambda: client.playlists_page(
+                    filter_by="all", page=1, page_size=2
+                ),
+            ),
+            (
+                {"works": [{"id": 1}, None]},
+                lambda: client.playlist_works_page(
+                    "playlist-id", page=1, page_size=2
+                ),
+            ),
+            (
+                {"works": [{"id": 1}, None]},
+                lambda: client.review_page(page=1, page_size=2),
+            ),
+            (
+                {"works": [{"work": None}]},
+                lambda: client.playlist_works_page(
+                    "playlist-id", page=1, page_size=2
+                ),
+            ),
+        )
+        for payload, fetch in cases:
+            with (
+                self.subTest(payload=payload),
+                patch.object(client, "request", return_value=(200, payload)),
+                self.assertRaises(asmr_one.PayloadError),
+            ):
+                fetch()
 
     def test_collect_works_uses_all_playlists_and_deduplicates(self) -> None:
         client = MagicMock()
@@ -1798,6 +1913,63 @@ class ChecksumTests(unittest.TestCase):
 
             self.assertEqual(outside.read_bytes(), b"hello")
 
+    def test_symlinked_directory_below_work_root_is_rejected(self) -> None:
+        client = MagicMock()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "work"
+            outside = Path(tmp) / "outside"
+            root.mkdir()
+            outside.mkdir()
+            (root / "folder").symlink_to(outside, target_is_directory=True)
+            dest = root / "folder" / "track.wav"
+
+            with self.assertRaisesRegex(asmr_one.LocalStateError, "symlink"):
+                asmr_one.download_one(
+                    client,
+                    "https://cdn.example/track.wav",
+                    dest,
+                    5,
+                    resume=False,
+                    remote=download_remote(),
+                    work_root=root,
+                )
+
+            self.assertFalse((outside / "track.wav").exists())
+            client.request.assert_not_called()
+
+    def test_replaced_partial_is_not_installed_after_validation(self) -> None:
+        client = MagicMock()
+        response = FakeResponse(b"hello", {"Content-Length": "5"})
+        client.request.return_value = (200, response)
+        original_close = asmr_one.close_response
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "track.wav"
+            part = asmr_one.part_file_path(dest)
+
+            def replace_on_close(current: object) -> None:
+                original_close(current)
+                replacement = Path(tmp) / "replacement.part"
+                replacement.write_bytes(b"jello")
+                os.replace(replacement, part)
+
+            with (
+                patch("asmr_one.close_response", side_effect=replace_on_close),
+                self.assertRaisesRegex(
+                    asmr_one.LocalStateError, "changed before installation"
+                ),
+            ):
+                asmr_one.download_one(
+                    client,
+                    "https://cdn.example/track.wav",
+                    dest,
+                    5,
+                    resume=False,
+                    remote=download_remote(),
+                )
+
+            self.assertFalse(dest.exists())
+            self.assertEqual(part.read_bytes(), b"jello")
+
     def test_download_work_only_requests_missing_files_and_keeps_old_records(
         self,
     ) -> None:
@@ -2368,6 +2540,58 @@ class GlobalTaskSchedulerTests(unittest.TestCase):
                 "https://cdn.example/moved-a.wav",
             )
 
+    def test_expired_signed_url_is_refreshed_before_retry(self) -> None:
+        work = self.work(1)
+        client = MagicMock()
+        track_calls = 0
+
+        def tracks(_work_id: int) -> list[dict[str, object]]:
+            nonlocal track_calls
+            track_calls += 1
+            return [
+                remote_file(
+                    "track.wav",
+                    url=f"https://cdn.example/track.wav?token={track_calls}",
+                    remote_id="work/track",
+                )
+            ]
+
+        urls: list[str] = []
+
+        def request(*_args: object, **kwargs: object) -> tuple[int, FakeResponse]:
+            url = str(kwargs["raw_url"])
+            urls.append(url)
+            if len(urls) == 1:
+                raise asmr_one.DownloadAuthorizationError(403, "expired")
+            return 200, FakeResponse(b"hello", {"Content-Length": "5"})
+
+        client.tracks.side_effect = tracks
+        client.request.side_effect = request
+        clock = FakeClock()
+        with tempfile.TemporaryDirectory() as tmp, patch("asmr_one.log"):
+            coordinator = asmr_one.DownloadCoordinator(
+                client,
+                download_args(tmp, jobs=1),
+            )
+            coordinator.scheduler = asmr_one.TaskScheduler(
+                1,
+                clock=clock,
+                sleeper=clock.sleep,
+            )
+
+            summary = coordinator.run_direct([work])
+
+        self.assertEqual((summary.ok, summary.fail), (1, 0))
+        self.assertEqual(
+            urls,
+            [
+                "https://cdn.example/track.wav?token=1",
+                "https://cdn.example/track.wav?token=2",
+            ],
+        )
+        self.assertEqual(track_calls, 2)
+        self.assertEqual(clock.sleeps, [60.0])
+
     def test_delayed_download_does_not_block_later_work_and_refreshes_url(self) -> None:
         works = [self.work(1), self.work(2)]
         track_calls = {1: 0, 2: 0}
@@ -2814,6 +3038,18 @@ class GlobalTaskSchedulerTests(unittest.TestCase):
                 ):
                     asmr_one.build_parser().parse_args(
                         [command[0], "--page-size", value, *command[1:]]
+                    )
+
+    def test_collection_parsers_reject_non_positive_limits(self) -> None:
+        for command in ("list", "download"):
+            for value in ("0", "-1"):
+                with (
+                    self.subTest(command=command, value=value),
+                    redirect_stderr(io.StringIO()),
+                    self.assertRaises(SystemExit),
+                ):
+                    asmr_one.build_parser().parse_args(
+                        [command, "--limit", value, "--work", "RJ1"]
                     )
 
 
