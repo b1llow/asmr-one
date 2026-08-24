@@ -316,6 +316,8 @@ class SelectBehaviorTests(unittest.TestCase):
         japanese_subtitle.update(type="file", ext=".srt")
         embedded_subtitle = remote_file("voice.en.wav.srt")
         embedded_subtitle.update(type="file", ext=".srt")
+        other_format_subtitle = remote_file("voice.en.flac.srt")
+        other_format_subtitle.update(type="file", ext=".srt")
 
         chosen = select_files(
             [
@@ -323,6 +325,7 @@ class SelectBehaviorTests(unittest.TestCase):
                 japanese_audio,
                 japanese_subtitle,
                 embedded_subtitle,
+                other_format_subtitle,
             ],
             audio_format="wav",
             include_subs=True,
@@ -1737,6 +1740,48 @@ class ChecksumTests(unittest.TestCase):
             self.assertFalse(asmr_one.part_file_path(dest).exists())
             self.assertIsNone(client.request.call_args.kwargs["range_header"])
             self.assertTrue(response.closed)
+
+    def test_download_record_rejects_destination_replacement(self) -> None:
+        file = remote_file()
+        client = MagicMock()
+        client.request.return_value = (
+            200,
+            FakeResponse(b"hello", {"Content-Length": "5"}),
+        )
+        real_download = asmr_one.download_one
+
+        def download_then_replace(*args: Any, **kwargs: Any) -> Any:
+            result = real_download(*args, **kwargs)
+            dest = Path(args[2])
+            replacement = dest.with_name("replacement.tmp")
+            replacement.write_bytes(b"world")
+            os.replace(replacement, dest)
+            return result
+
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "track.wav"
+            context = asmr_one.LocalFileContext(
+                file,
+                dest,
+                "track.wav",
+                "track.wav",
+                None,
+            )
+            plan = asmr_one.LocalFilePlan(
+                file,
+                dest,
+                "track.wav",
+                "missing",
+            )
+
+            with (
+                patch("asmr_one.download_one", side_effect=download_then_replace),
+                self.assertRaisesRegex(
+                    asmr_one.LocalStateError,
+                    "changed after installation",
+                ),
+            ):
+                asmr_one.download_file_and_record(client, context, plan)
 
     def test_download_checkpoints_progress_at_configured_intervals(self) -> None:
         client = MagicMock()

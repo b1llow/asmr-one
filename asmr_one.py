@@ -133,6 +133,7 @@ class LocalFilePlan:
 class DownloadResult:
     status: str
     digest: str
+    installed_signature: tuple[int, int, int, int, int]
 
 
 @dataclass(frozen=True)
@@ -853,18 +854,28 @@ def format_rank(ext: str, preferred: str) -> int:
     return 0 if ext == want else 9
 
 
-def directory_stem_key(file: Mapping[str, Any]) -> tuple[tuple[str, ...], str]:
+def directory_stem_key(
+    file: Mapping[str, Any],
+) -> tuple[tuple[str, ...], str, str | None]:
     raw_path = tuple(str(part) for part in file.get("path") or ())
     filename = raw_path[-1] if raw_path else str(file.get("title") or "")
     parent = tuple(
         unicodedata.normalize("NFC", part).casefold() for part in raw_path[:-1]
     )
     stem = Path(unicodedata.normalize("NFC", filename)).stem
-    if str(file.get("ext") or "").casefold() in SUB_EXTS:
+    file_ext = str(file.get("ext") or "").casefold()
+    matched_audio_ext: str | None = file_ext
+    if file_ext in SUB_EXTS:
+        matched_audio_ext = None
         embedded_suffix = Path(stem).suffix.casefold()
         if embedded_suffix in AUDIO_EXTS:
             stem = Path(stem).stem
-    return parent, unicodedata.normalize("NFC", stem).casefold()
+            matched_audio_ext = embedded_suffix
+    return (
+        parent,
+        unicodedata.normalize("NFC", stem).casefold(),
+        matched_audio_ext,
+    )
 
 
 def select_files(
@@ -890,8 +901,17 @@ def select_files(
         chosen = list(audio)
         if include_subs:
             audio_keys = {directory_stem_key(f) for f in audio}
+            audio_stems = {(parent, stem) for parent, stem, _ in audio_keys}
             for f in files:
-                if f["ext"] in SUB_EXTS and directory_stem_key(f) in audio_keys:
+                if f["ext"] not in SUB_EXTS:
+                    continue
+                subtitle_key = directory_stem_key(f)
+                parent, stem, embedded_audio_ext = subtitle_key
+                if (
+                    subtitle_key in audio_keys
+                    if embedded_audio_ext is not None
+                    else (parent, stem) in audio_stems
+                ):
                     chosen.append(f)
     # De-duplicate repeated identical entries, but retain conflicting identities
     # so local path preparation can reject them explicitly.
@@ -1998,6 +2018,26 @@ def require_file_signature(
         raise LocalStateError(f"partial file changed before installation: {path}")
 
 
+def installed_file_stat(
+    path: Path,
+    expected: tuple[int, int, int, int, int],
+    *,
+    allow_rename_ctime: bool = False,
+) -> os.stat_result:
+    if path.is_symlink() or not path.is_file():
+        raise LocalStateError(f"download target disappeared after installation: {path}")
+    actual = path.stat()
+    actual_signature = stat_signature(actual)
+    signatures_match = (
+        actual_signature[:4] == expected[:4]
+        if allow_rename_ctime
+        else actual_signature == expected
+    )
+    if not signatures_match:
+        raise LocalStateError(f"download target changed after installation: {path}")
+    return actual
+
+
 def open_validated_partial(
     dest: Path,
     remote: dict[str, Any],
@@ -2149,8 +2189,13 @@ def download_one(
         require_file_signature(tmp, partial_signature)
         os.replace(tmp, dest)
         fsync_directory(dest.parent)
+        installed_stat = installed_file_stat(
+            dest,
+            partial_signature,
+            allow_rename_ctime=True,
+        )
         remove_partial_state(dest)
-        return DownloadResult("resume", digest)
+        return DownloadResult("resume", digest, stat_signature(installed_stat))
 
     range_header = f"bytes={existing}-" if existing else None
     request_headers = (
@@ -2353,8 +2398,17 @@ def download_one(
     require_file_signature(tmp, final_signature)
     os.replace(tmp, dest)
     fsync_directory(dest.parent)
+    installed_stat = installed_file_stat(
+        dest,
+        final_signature,
+        allow_rename_ctime=True,
+    )
     remove_partial_state(dest)
-    return DownloadResult(result_status, final_state.committed_blake3)
+    return DownloadResult(
+        result_status,
+        final_state.committed_blake3,
+        stat_signature(installed_stat),
+    )
 
 
 def download_file_and_record(
@@ -2375,7 +2429,15 @@ def download_file_and_record(
     )
     return DownloadOutcome(
         result,
-        checksum_record(context.file, context.dest, result.digest),
+        checksum_record(
+            context.file,
+            context.dest,
+            result.digest,
+            stat_result=installed_file_stat(
+                context.dest,
+                result.installed_signature,
+            ),
+        ),
         context,
         plan,
     )
