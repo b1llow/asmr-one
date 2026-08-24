@@ -11,10 +11,12 @@ import email.utils
 import fcntl
 import heapq
 import http.client
+import ipaddress
 import json
 import math
 import os
 import re
+import socket
 import ssl
 import stat as stat_module
 import sys
@@ -66,6 +68,9 @@ CHECKSUM_ALGORITHM = "blake3"
 DOWNLOAD_CHUNK_SIZE = 1024 * 1024
 PART_STATE_VERSION = 1
 PART_CHECKPOINT_SIZE = 64 * 1024 * 1024
+RESPONSE_READ_CHUNK_SIZE = 64 * 1024
+MAX_API_RESPONSE_BYTES = 8 * 1024 * 1024
+MAX_ERROR_RESPONSE_BYTES = 64 * 1024
 WORK_LOCK_FILE_NAME = ".asmr-one.lock"
 MAX_LOCAL_COMPONENT_BYTES = 240
 MAX_WORK_FOLDER_BYTES = 180
@@ -534,6 +539,7 @@ class OrderedPageStream:
         self._next_to_emit = 1
         self._final_page: int | None = None
         self._finished = False
+        self._window_size = scheduler.jobs
 
     def start(self) -> None:
         self._schedule(1)
@@ -578,8 +584,6 @@ class OrderedPageStream:
                 )
                 return
             self._final_page = result.page_count
-            for next_page in range(1, result.page_count + 1):
-                self._schedule(next_page)
         elif result.has_more:
             self._schedule(page + 1)
         else:
@@ -592,9 +596,20 @@ class OrderedPageStream:
             self.on_items(emitted.items)
             if self.should_stop():
                 return
+        self._fill_window()
         if self._final_page is not None and self._next_to_emit > self._final_page:
             self._finished = True
             self.on_done()
+
+    def _fill_window(self) -> None:
+        if self._final_page is None:
+            return
+        last_page = min(
+            self._final_page,
+            self._next_to_emit + self._window_size - 1,
+        )
+        for page in range(self._next_to_emit, last_page + 1):
+            self._schedule(page)
 
     def _fail(self, exc: BaseException) -> None:
         if self._finished:
@@ -778,15 +793,17 @@ def flatten_tracks(nodes: Any, prefix: tuple[str, ...] = ()) -> list[dict[str, A
         title = str(node.get("title") or "file")
         children = node.get("children")
         url = node.get("mediaDownloadUrl") or node.get("mediaStreamUrl")
-        if node.get("type") == "folder" or (
-            children is not None and not url
+        node_type = str(node.get("type") or "").casefold()
+        if node_type == "folder" or (
+            not node_type and children is not None and not url
         ):
             if not isinstance(children, list):
                 raise PayloadError(f"track folder {title!r} has invalid children")
             files.extend(flatten_tracks(children, prefix + (title,)))
             continue
-        if not url:
-            continue
+        if not isinstance(url, str) or not url.strip():
+            raise PayloadError(f"track file {title!r} has no usable media URL")
+        url = url.strip()
         ext = Path(urllib.parse.urlsplit(str(url)).path).suffix.lower()
         if not ext:
             ext = Path(title).suffix.lower()
@@ -893,8 +910,18 @@ def select_files(
     else:
         audio = [f for f in files if f["ext"] in AUDIO_EXTS or f["type"] == "audio"]
         if audio_format == "best" and audio:
-            best = min(format_rank(f["ext"], audio_format) for f in audio)
-            audio = [f for f in audio if format_rank(f["ext"], audio_format) == best]
+            best_by_track: dict[tuple[tuple[str, ...], str], int] = {}
+            for file in audio:
+                parent, stem, _ = directory_stem_key(file)
+                key = parent, stem
+                rank = format_rank(file["ext"], audio_format)
+                best_by_track[key] = min(best_by_track.get(key, rank), rank)
+            audio = [
+                file
+                for file in audio
+                if format_rank(file["ext"], audio_format)
+                == best_by_track[directory_stem_key(file)[:2]]
+            ]
         elif audio_format != "best":
             wanted = f".{audio_format.lstrip('.').lower()}"
             audio = [f for f in audio if f["ext"].lower() == wanted]
@@ -1009,12 +1036,116 @@ LOCK_RETRY_POLICY = RetryPolicy(
 )
 
 
+def read_bounded_body(
+    response: Any,
+    limit: int,
+    *,
+    truncate: bool = False,
+) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    while total <= limit:
+        chunk = response.read(
+            min(RESPONSE_READ_CHUNK_SIZE, limit + 1 - total)
+        )
+        if not chunk:
+            break
+        if not isinstance(chunk, bytes):
+            raise PayloadError("response body is not bytes")
+        chunks.append(chunk)
+        total += len(chunk)
+    body = b"".join(chunks)
+    if len(body) <= limit:
+        return body
+    if truncate:
+        return body[:limit] + b"\n[response body truncated]"
+    raise PayloadError(f"response body exceeds {limit} bytes")
+
+
+def validate_media_url(url: str) -> None:
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        port = parsed.port or 443
+    except ValueError as exc:
+        raise PayloadError(f"invalid media URL: {url!r}") from exc
+    if (
+        parsed.scheme.casefold() != "https"
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise PayloadError("media URL must be credential-free HTTPS")
+
+    hostname = parsed.hostname.rstrip(".").casefold()
+    if not hostname or hostname == "localhost" or hostname.endswith(
+        (".localhost", ".local", ".internal", ".lan", ".home")
+    ):
+        raise PayloadError(f"media URL targets a local host: {hostname!r}")
+
+    try:
+        literal_addresses = [ipaddress.ip_address(hostname)]
+    except ValueError:
+        try:
+            resolved = socket.getaddrinfo(
+                hostname,
+                port,
+                type=socket.SOCK_STREAM,
+            )
+        except OSError as exc:
+            raise RequestTransportError(
+                f"cannot resolve media host {hostname!r}: {exc}"
+            ) from exc
+        literal_addresses = []
+        for info in resolved:
+            try:
+                literal_addresses.append(ipaddress.ip_address(info[4][0]))
+            except (IndexError, ValueError):
+                continue
+
+    if not literal_addresses:
+        raise RequestTransportError(f"media host {hostname!r} has no IP address")
+    if any(not address.is_global for address in literal_addresses):
+        raise PayloadError(f"media URL resolves to a non-public address: {hostname!r}")
+
+
+class SafeMediaRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Mapping[str, str],
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        validate_media_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 class Client:
     def __init__(self, token: str | None = None, timeout: int = 30):
         self.token = token
         self.timeout = timeout
         self.mirror = DEFAULT_MIRRORS[0]
         self._ctx = ssl.create_default_context()
+        self._media_opener = urllib.request.build_opener(
+            SafeMediaRedirectHandler(),
+            urllib.request.HTTPSHandler(context=self._ctx),
+        )
+
+    def _open_request(
+        self,
+        request: urllib.request.Request,
+        *,
+        media: bool,
+    ) -> Any:
+        if media:
+            return self._media_opener.open(request, timeout=self.timeout)
+        return urllib.request.urlopen(
+            request,
+            timeout=self.timeout,
+            context=self._ctx,
+        )
 
     def _headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:
         headers = {
@@ -1053,6 +1184,7 @@ class Client:
         longest_retry_after: float | None = None
         attempts: list[tuple[str, str | None]]
         if raw_url:
+            validate_media_url(raw_url)
             attempts = [(raw_url, None)]
         else:
             mirrors = (self.mirror,) + tuple(
@@ -1075,16 +1207,23 @@ class Client:
                     "Authorization", f"Bearer {self.token}"
                 )
             try:
-                resp = urllib.request.urlopen(
-                    req, timeout=self.timeout, context=self._ctx
-                )
+                resp = self._open_request(req, media=raw_url is not None)
+                if raw_url is not None:
+                    final_url = (
+                        resp.geturl() if hasattr(resp, "geturl") else url
+                    )
+                    try:
+                        validate_media_url(str(final_url))
+                    except Exception:
+                        resp.close()
+                        raise
                 status = getattr(resp, "status", 200)
                 if stream:
                     if api_mirror is not None:
                         self.mirror = api_mirror
                     return status, resp
                 try:
-                    raw = resp.read()
+                    raw = read_bounded_body(resp, MAX_API_RESPONSE_BYTES)
                 finally:
                     resp.close()
                 if raw:
@@ -1099,7 +1238,11 @@ class Client:
                 return status, payload
             except urllib.error.HTTPError as exc:
                 try:
-                    payload = exc.read().decode("utf-8", "replace")
+                    payload = read_bounded_body(
+                        exc,
+                        MAX_ERROR_RESPONSE_BYTES,
+                        truncate=True,
+                    ).decode("utf-8", "replace")
                 except (
                     urllib.error.URLError,
                     TimeoutError,
@@ -3430,7 +3573,19 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
-    args.func(args)
+    try:
+        args.func(args)
+    except (
+        ApiError,
+        LocalStateError,
+        OSError,
+        PayloadError,
+        RemoteFileUnavailableError,
+        RequestTransportError,
+        RetryableDownloadError,
+        WorkLockedError,
+    ) as exc:
+        die(str(exc), code=2)
 
 
 if __name__ == "__main__":

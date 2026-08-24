@@ -175,6 +175,33 @@ class BrandingTests(unittest.TestCase):
         return Path(result.stdout.strip())
 
 
+class MainTests(unittest.TestCase):
+    def test_expected_operational_errors_are_reported_without_tracebacks(self) -> None:
+        errors = (
+            ApiError(401, "expired"),
+            asmr_one.LocalStateError("unsafe local state"),
+            asmr_one.PayloadError("bad payload"),
+            asmr_one.RequestTransportError("network unavailable"),
+            OSError("disk unavailable"),
+        )
+        for error in errors:
+            handler = MagicMock(side_effect=error)
+            parser = MagicMock()
+            parser.parse_args.return_value = argparse.Namespace(func=handler)
+            stderr = io.StringIO()
+            with (
+                self.subTest(error=error),
+                patch("asmr_one.build_parser", return_value=parser),
+                redirect_stderr(stderr),
+                self.assertRaises(SystemExit) as raised,
+            ):
+                asmr_one.main([])
+
+            self.assertEqual(raised.exception.code, 2)
+            self.assertIn(f"error: {error}", stderr.getvalue())
+            self.assertNotIn("Traceback", stderr.getvalue())
+
+
 class SelectTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -238,6 +265,20 @@ class SelectBehaviorTests(unittest.TestCase):
         )
 
         self.assertEqual(chosen, [])
+
+    def test_best_format_is_selected_per_logical_track(self) -> None:
+        intro_wav = remote_file("intro.wav")
+        intro_mp3 = remote_file("intro.mp3")
+        chapter_mp3 = remote_file("chapter.mp3")
+
+        chosen = select_files(
+            [intro_mp3, chapter_mp3, intro_wav],
+            audio_format="best",
+            include_subs=False,
+            all_langs=True,
+        )
+
+        self.assertEqual(chosen, [chapter_mp3, intro_wav])
 
     def test_ja_only_with_all_keeps_japanese_non_audio_files(self) -> None:
         japanese_audio = remote_file(
@@ -627,11 +668,27 @@ class ClientTests(unittest.TestCase):
             requests.append(request)
             return FakeResponse(b"{}")
 
+        client = asmr_one.Client(token="secret")
         with (
             patch.object(asmr_one, "DEFAULT_MIRRORS", ("https://api.example",)),
-            patch("asmr_one.urllib.request.urlopen", side_effect=urlopen),
+            patch.object(
+                client,
+                "_open_request",
+                side_effect=lambda request, **_kwargs: urlopen(request),
+            ),
+            patch(
+                "asmr_one.socket.getaddrinfo",
+                return_value=[
+                    (
+                        asmr_one.socket.AF_INET,
+                        asmr_one.socket.SOCK_STREAM,
+                        6,
+                        "",
+                        ("8.8.8.8", 443),
+                    )
+                ],
+            ),
         ):
-            client = asmr_one.Client(token="secret")
             _, response = client.request(
                 "GET", "", raw_url="https://cdn.example/file", stream=True
             )
@@ -712,6 +769,24 @@ class ClientTests(unittest.TestCase):
         with patch.object(client, "request", return_value=(200, {"tracks": []})):
             self.assertEqual(client.tracks("RJ1"), [])
 
+    def test_tracks_rejects_leaf_without_a_media_url(self) -> None:
+        payload = [
+            {
+                "title": "voice.wav",
+                "size": 5,
+                "hash": "work/voice",
+                "type": "audio",
+            }
+        ]
+        client = asmr_one.Client()
+        with (
+            patch.object(client, "request", return_value=(200, payload)),
+            self.assertRaises(asmr_one.PayloadError) as raised,
+        ):
+            client.tracks("RJ1")
+
+        self.assertFalse(asmr_one.is_retryable_network_error(raised.exception))
+
     def test_tracks_uses_later_nonempty_container(self) -> None:
         node = {
             "title": "track.wav",
@@ -783,11 +858,22 @@ class ClientTests(unittest.TestCase):
             {},
             io.BytesIO(b"expired"),
         )
-        with patch(
-            "asmr_one.urllib.request.urlopen",
-            side_effect=forbidden,
+        client = asmr_one.Client()
+        with (
+            patch.object(client, "_open_request", side_effect=forbidden),
+            patch(
+                "asmr_one.socket.getaddrinfo",
+                return_value=[
+                    (
+                        asmr_one.socket.AF_INET,
+                        asmr_one.socket.SOCK_STREAM,
+                        6,
+                        "",
+                        ("8.8.8.8", 443),
+                    )
+                ],
+            ),
         ):
-            client = asmr_one.Client()
             with self.assertRaises(
                 asmr_one.DownloadAuthorizationError
             ) as raised:
@@ -806,15 +892,117 @@ class ClientTests(unittest.TestCase):
     def test_incomplete_json_response_becomes_retryable_transport_error(self) -> None:
         client = asmr_one.Client()
         with (
-            patch(
-                "asmr_one.urllib.request.urlopen",
+            patch.object(
+                client,
+                "_open_request",
                 side_effect=asmr_one.http.client.IncompleteRead(b"{", 2),
+            ),
+            patch(
+                "asmr_one.socket.getaddrinfo",
+                return_value=[
+                    (
+                        asmr_one.socket.AF_INET,
+                        asmr_one.socket.SOCK_STREAM,
+                        6,
+                        "",
+                        ("8.8.8.8", 443),
+                    )
+                ],
             ),
             self.assertRaises(asmr_one.RequestTransportError) as raised,
         ):
             client.request("GET", "", raw_url="https://api.example/data")
 
         self.assertTrue(asmr_one.is_retryable_network_error(raised.exception))
+
+    def test_non_stream_response_body_is_bounded(self) -> None:
+        client = asmr_one.Client()
+        response = FakeResponse(b"12345")
+        with (
+            patch.object(asmr_one, "DEFAULT_MIRRORS", ("https://api.example",)),
+            patch("asmr_one.urllib.request.urlopen", return_value=response),
+            patch.object(asmr_one, "MAX_API_RESPONSE_BYTES", 4),
+            self.assertRaises(asmr_one.PayloadError) as raised,
+        ):
+            client.request("GET", "/data")
+
+        self.assertIn("exceeds 4 bytes", str(raised.exception))
+        self.assertTrue(response.closed)
+
+    def test_media_urls_reject_local_targets_and_unsafe_final_redirects(self) -> None:
+        client = asmr_one.Client()
+        with (
+            patch.object(client, "_open_request") as open_request,
+            self.assertRaises(asmr_one.PayloadError),
+        ):
+            client.request(
+                "GET",
+                "",
+                raw_url="http://127.0.0.1/private",
+                stream=True,
+            )
+        open_request.assert_not_called()
+
+        with (
+            patch.object(client, "_open_request") as open_request,
+            patch(
+                "asmr_one.socket.getaddrinfo",
+                return_value=[
+                    (
+                        asmr_one.socket.AF_INET,
+                        asmr_one.socket.SOCK_STREAM,
+                        6,
+                        "",
+                        ("10.0.0.1", 443),
+                    )
+                ],
+            ),
+            self.assertRaises(asmr_one.PayloadError),
+        ):
+            client.request(
+                "GET",
+                "",
+                raw_url="https://cdn.example/private",
+                stream=True,
+            )
+        open_request.assert_not_called()
+
+        response = FakeResponse(b"data")
+        response.geturl = lambda: "https://127.0.0.1/private"  # type: ignore[attr-defined]
+        with (
+            patch.object(client, "_open_request", return_value=response),
+            patch(
+                "asmr_one.socket.getaddrinfo",
+                return_value=[
+                    (
+                        asmr_one.socket.AF_INET,
+                        asmr_one.socket.SOCK_STREAM,
+                        6,
+                        "",
+                        ("8.8.8.8", 443),
+                    )
+                ],
+            ),
+            self.assertRaises(asmr_one.PayloadError),
+        ):
+            client.request(
+                "GET",
+                "",
+                raw_url="https://cdn.example/file",
+                stream=True,
+            )
+        self.assertTrue(response.closed)
+
+        handler = asmr_one.SafeMediaRedirectHandler()
+        with self.assertRaises(asmr_one.PayloadError):
+            handler.redirect_request(
+                asmr_one.urllib.request.Request("https://cdn.example/file"),
+                None,
+                302,
+                "Found",
+                {},
+                "https://127.0.0.1/private",
+            )
 
     def test_successful_invalid_payload_is_not_retryable(self) -> None:
         client = asmr_one.Client()
@@ -2527,6 +2715,43 @@ class GlobalTaskSchedulerTests(unittest.TestCase):
             "source_id": f"RJ{number:06d}",
             "title": f"Work {number}",
         }
+
+    def test_reported_page_count_is_scheduled_through_a_bounded_window(self) -> None:
+        scheduler = MagicMock()
+        scheduler.jobs = 2
+        tasks: list[asmr_one.ScheduledTask] = []
+        scheduler.enqueue.side_effect = tasks.append
+        emitted: list[int] = []
+        stream = asmr_one.OrderedPageStream(
+            scheduler,
+            owner="pages",
+            label="collection",
+            fetch_page=lambda page: self.fail(f"unexpected fetch {page}"),
+            on_items=lambda items: emitted.extend(int(item["id"]) for item in items),
+            on_done=lambda: self.fail("huge stream finished"),
+            on_error=lambda exc: self.fail(str(exc)),
+            should_stop=lambda: False,
+        )
+
+        stream.start()
+        self.assertEqual(len(tasks), 1)
+        tasks[0].on_success(
+            asmr_one.FetchedPage([{"id": 1}], 1_000_000, True)
+        )
+
+        self.assertEqual(emitted, [1])
+        self.assertEqual([task.label for task in tasks], [
+            "collection page=1",
+            "collection page=2",
+            "collection page=3",
+        ])
+
+        tasks[1].on_success(
+            asmr_one.FetchedPage([{"id": 2}], 1_000_000, True)
+        )
+        self.assertEqual(emitted, [1, 2])
+        self.assertEqual(tasks[-1].label, "collection page=4")
+        self.assertEqual(len(tasks), 4)
 
     def test_scheduler_enforces_one_global_worker_limit(self) -> None:
         scheduler = asmr_one.TaskScheduler(2)
