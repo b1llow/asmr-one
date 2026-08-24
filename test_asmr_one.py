@@ -821,29 +821,90 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(tracks[0]["title"], "track.wav")
 
     def test_track_title_supplies_extension_for_opaque_url(self) -> None:
-        payload = [
-            {
-                "title": "voice.wav",
-                "mediaDownloadUrl": "https://cdn.example/download/opaque",
-                "size": 5,
-                "hash": "work/voice",
-                "type": "audio",
-            }
-        ]
         client = asmr_one.Client()
-        with patch.object(client, "request", return_value=(200, payload)):
-            tracks = client.tracks("RJ1")
+        for url in (
+            "https://cdn.example/download/opaque",
+            "https://cdn.example/download.php?id=1",
+            "https://cdn.example/object.bin",
+        ):
+            payload = [
+                {
+                    "title": "voice.wav",
+                    "mediaDownloadUrl": url,
+                    "size": 5,
+                    "hash": "work/voice",
+                    "type": "audio",
+                }
+            ]
+            with (
+                self.subTest(url=url),
+                patch.object(client, "request", return_value=(200, payload)),
+            ):
+                tracks = client.tracks("RJ1")
 
-        self.assertEqual(tracks[0]["ext"], ".wav")
-        self.assertEqual(
-            select_files(
+            self.assertEqual(tracks[0]["ext"], ".wav")
+            self.assertEqual(
+                select_files(
+                    tracks,
+                    audio_format="wav",
+                    include_subs=False,
+                    all_langs=True,
+                ),
                 tracks,
-                audio_format="wav",
-                include_subs=False,
-                all_langs=True,
-            ),
-            tracks,
+            )
+
+    def test_tracks_rejects_invalid_remote_sizes(self) -> None:
+        client = asmr_one.Client()
+        invalid_sizes = (
+            True,
+            False,
+            -1,
+            -1.0,
+            5.0,
+            5.9,
+            float("inf"),
+            "5.0",
+            "-1",
         )
+        for size in invalid_sizes:
+            payload = [
+                {
+                    "title": "voice.wav",
+                    "mediaDownloadUrl": "https://cdn.example/voice.wav",
+                    "size": size,
+                    "hash": "work/voice",
+                    "type": "audio",
+                }
+            ]
+            with (
+                self.subTest(size=size),
+                patch.object(client, "request", return_value=(200, payload)),
+                self.assertRaises(asmr_one.PayloadError) as raised,
+            ):
+                client.tracks("RJ1")
+            self.assertFalse(
+                asmr_one.is_retryable_network_error(raised.exception)
+            )
+
+    def test_tracks_normalizes_valid_remote_sizes(self) -> None:
+        client = asmr_one.Client()
+        valid_sizes = ((None, None), (0, 0), (5, 5), ("5", 5), (" 5 ", 5))
+        for size, expected in valid_sizes:
+            payload = [
+                {
+                    "title": "voice.wav",
+                    "mediaDownloadUrl": "https://cdn.example/voice.wav",
+                    "size": size,
+                    "hash": "work/voice",
+                    "type": "audio",
+                }
+            ]
+            with (
+                self.subTest(size=size),
+                patch.object(client, "request", return_value=(200, payload)),
+            ):
+                tracks = client.tracks("RJ1")
+            self.assertEqual(tracks[0]["size"], expected)
 
     def test_stream_only_leaf_with_children_is_not_treated_as_a_folder(self) -> None:
         payload = [
@@ -940,6 +1001,19 @@ class ClientTests(unittest.TestCase):
             client.request("GET", "/data")
 
         self.assertIn("exceeds 4 bytes", str(raised.exception))
+        self.assertTrue(response.closed)
+
+    def test_non_stream_response_rejects_invalid_utf8(self) -> None:
+        client = asmr_one.Client()
+        response = FakeResponse(b"\xff")
+        with (
+            patch.object(asmr_one, "DEFAULT_MIRRORS", ("https://api.example",)),
+            patch("asmr_one.urllib.request.urlopen", return_value=response),
+            self.assertRaises(asmr_one.PayloadError) as raised,
+        ):
+            client.request("GET", "/data")
+
+        self.assertFalse(asmr_one.is_retryable_network_error(raised.exception))
         self.assertTrue(response.closed)
 
     def test_media_urls_reject_local_targets_and_unsafe_final_redirects(self) -> None:
@@ -3786,21 +3860,28 @@ class GlobalTaskSchedulerTests(unittest.TestCase):
         self.assertEqual(summary.works, 1)
         self.assertEqual(client.review_page.call_count, 1)
 
-    def test_playlist_pages_can_fetch_out_of_order_but_admit_in_order(self) -> None:
+    def test_playlist_content_streams_run_one_at_a_time(self) -> None:
         client = MagicMock()
         client.playlists_page.return_value = asmr_one.FetchedPage(
             [{"id": "first"}, {"id": "second"}], 1, False
         )
-        second_finished = threading.Event()
+        first_finished = threading.Event()
+        second_started = threading.Event()
+        overlaps: list[bool] = []
+        playlist_calls: list[str] = []
 
         def playlist_works_page(
             playlist_id: str, *, page: int, page_size: int
         ) -> asmr_one.FetchedPage:
             self.assertEqual((page, page_size), (1, 2))
+            playlist_calls.append(playlist_id)
             if playlist_id == "first":
-                self.assertTrue(second_finished.wait(timeout=3))
+                self.assertFalse(first_finished.is_set())
+                overlaps.append(second_started.wait(timeout=0.25))
+                first_finished.set()
                 return asmr_one.FetchedPage([self.work(1), self.work(2)], 1, False)
-            second_finished.set()
+            second_started.set()
+            self.assertTrue(first_finished.is_set())
             return asmr_one.FetchedPage([self.work(2), self.work(3)], 1, False)
 
         client.playlist_works_page.side_effect = playlist_works_page
@@ -3824,7 +3905,11 @@ class GlobalTaskSchedulerTests(unittest.TestCase):
             summary = coordinator.run_collection()
 
         self.assertEqual(admitted, [1, 2, 3])
+        self.assertEqual(playlist_calls, ["first", "second"])
+        self.assertEqual(overlaps, [False])
         self.assertEqual(summary.works, 3)
+        self.assertEqual(coordinator._active_playlist_streams, 0)
+        self.assertFalse(coordinator._pending_playlists)
         self.assertTrue(
             all(
                 isinstance(buffer, deque)

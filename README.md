@@ -93,7 +93,9 @@ retries fetch a fresh track list and signed download URL first, while keeping th
 local destination chosen from the initial track snapshot. Waiting retries do not
 occupy a `--jobs` worker and, when due, return at the end of the ready queue so
 later works can continue. Active work states (and therefore held lock descriptors)
-are capped at twice `--jobs` even during a widespread outage. Invalid
+are capped at twice `--jobs` even during a widespread outage. Playlist contents
+are listed one playlist at a time, while pages within that playlist retain the
+bounded `--jobs` concurrency window. Invalid
 successful-response payloads and permanent HTTP errors fail immediately; after
 the five delayed retries, the final transient failure is reported once. `--dry-run`
 performs the same local classification (and requested verification) but creates

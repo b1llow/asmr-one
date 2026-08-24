@@ -50,6 +50,25 @@ USER_AGENT = (
 )
 AUDIO_EXTS = {".mp3", ".flac", ".wav", ".m4a", ".ogg", ".aac", ".opus"}
 SUB_EXTS = {".lrc", ".vtt", ".srt", ".ass", ".txt"}
+TRACK_MEDIA_EXTS = AUDIO_EXTS | SUB_EXTS | {
+    ".7z",
+    ".avi",
+    ".bmp",
+    ".gif",
+    ".jpeg",
+    ".jpg",
+    ".m4v",
+    ".mkv",
+    ".mov",
+    ".mp4",
+    ".pdf",
+    ".png",
+    ".rar",
+    ".webm",
+    ".webp",
+    ".wmv",
+    ".zip",
+}
 JA_HINTS = ("日本語", "日語", "日语", "japanese", "ja-jp", "ja_jp", "01日")
 PLAYLIST_SOURCES = {"auto", "playlists", "favorites"}
 SYSTEM_PLAYLIST_DISPLAY_NAMES = {
@@ -785,6 +804,27 @@ def first_list_container(
     return empty
 
 
+def parse_remote_file_size(value: Any, title: str) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise PayloadError(f"track file {title!r} has invalid size {value!r}")
+    if isinstance(value, int):
+        size = value
+    elif isinstance(value, str) and re.fullmatch(r"[0-9]+", value.strip()):
+        try:
+            size = int(value.strip())
+        except ValueError as exc:
+            raise PayloadError(
+                f"track file {title!r} has invalid size {value!r}"
+            ) from exc
+    else:
+        raise PayloadError(f"track file {title!r} has invalid size {value!r}")
+    if size < 0:
+        raise PayloadError(f"track file {title!r} has invalid size {value!r}")
+    return size
+
+
 def flatten_tracks(nodes: Any, prefix: tuple[str, ...] = ()) -> list[dict[str, Any]]:
     files: list[dict[str, Any]] = []
     if isinstance(nodes, dict):
@@ -808,17 +848,18 @@ def flatten_tracks(nodes: Any, prefix: tuple[str, ...] = ()) -> list[dict[str, A
         if not isinstance(url, str) or not url.strip():
             raise PayloadError(f"track file {title!r} has no usable media URL")
         url = url.strip()
-        ext = Path(urllib.parse.urlsplit(str(url)).path).suffix.lower()
-        if not ext:
-            ext = Path(title).suffix.lower()
+        title_ext = Path(title).suffix.lower()
+        url_ext = Path(urllib.parse.urlsplit(url).path).suffix.lower()
+        if title_ext in TRACK_MEDIA_EXTS and url_ext not in TRACK_MEDIA_EXTS:
+            ext = title_ext
+        else:
+            ext = url_ext or title_ext
         files.append(
             {
                 "title": title,
                 "path": prefix + (title,),
                 "url": url,
-                "size": int(node["size"])
-                if str(node.get("size") or "").isdigit()
-                else node.get("size"),
+                "size": parse_remote_file_size(node.get("size"), title),
                 "hash": node.get("hash"),
                 "type": node.get("type") or "file",
                 "ext": ext,
@@ -1232,7 +1273,13 @@ class Client:
                     resp.close()
                 if raw:
                     try:
-                        payload = json.loads(raw.decode("utf-8"))
+                        decoded = raw.decode("utf-8")
+                    except UnicodeDecodeError as exc:
+                        raise PayloadError(
+                            "successful response body is not valid UTF-8"
+                        ) from exc
+                    try:
+                        payload = json.loads(decoded)
                     except json.JSONDecodeError:
                         payload = raw
                 else:
@@ -1559,11 +1606,9 @@ def part_state_path(dest: Path) -> Path:
 
 def expected_file_size(file: dict[str, Any]) -> int | None:
     value = file.get("size")
-    try:
-        size = int(value)
-    except (TypeError, ValueError):
+    if isinstance(value, bool) or not isinstance(value, int):
         return None
-    return size if size >= 0 else None
+    return value if value >= 0 else None
 
 
 def stable_remote_id(file: Mapping[str, Any]) -> str | None:
@@ -2910,6 +2955,9 @@ class DownloadCoordinator:
         self._playlist_release_index = 0
         self._playlist_buffers: dict[int, deque[dict[str, Any]]] = {}
         self._playlist_done: set[int] = set()
+        self._pending_playlists: deque[dict[str, Any]] = deque()
+        self._active_playlist_streams = 0
+        self.max_active_playlist_streams = 1
         self.max_active_works = args.jobs * 2
 
     def run_collection(self) -> DownloadSummary:
@@ -3011,15 +3059,13 @@ class DownloadCoordinator:
         def receive(playlists: list[dict[str, Any]]) -> None:
             self._playlists.extend(playlists)
             if not selectors:
-                for playlist in playlists:
-                    self._start_playlist_work_stream(playlist)
+                self._queue_playlist_work_streams(playlists)
 
         def finish() -> None:
             self._playlist_listing_done = True
             if selectors:
                 selected = select_playlists(self._playlists, selectors)
-                for playlist in selected:
-                    self._start_playlist_work_stream(playlist)
+                self._queue_playlist_work_streams(selected)
                 log(f"{len(selected)} playlists selected")
             else:
                 log(f"{len(self._playlists)} playlists selected")
@@ -3034,6 +3080,20 @@ class DownloadCoordinator:
             on_done=finish,
         )
 
+    def _queue_playlist_work_streams(
+        self, playlists: Iterable[dict[str, Any]]
+    ) -> None:
+        self._pending_playlists.extend(playlists)
+        self._start_queued_playlist_work_streams()
+
+    def _start_queued_playlist_work_streams(self) -> None:
+        while (
+            not self.discovery_stopped
+            and self._pending_playlists
+            and self._active_playlist_streams < self.max_active_playlist_streams
+        ):
+            self._start_playlist_work_stream(self._pending_playlists.popleft())
+
     def _start_playlist_work_stream(self, playlist: dict[str, Any]) -> None:
         if self.discovery_stopped:
             return
@@ -3044,6 +3104,7 @@ class DownloadCoordinator:
         index = self._playlist_count
         self._playlist_count += 1
         self._playlist_buffers[index] = deque()
+        self._active_playlist_streams += 1
 
         def receive(works: list[dict[str, Any]]) -> None:
             self._playlist_buffers[index].extend(works)
@@ -3051,7 +3112,9 @@ class DownloadCoordinator:
 
         def finish() -> None:
             self._playlist_done.add(index)
+            self._active_playlist_streams -= 1
             self._release_playlist_works()
+            self._start_queued_playlist_work_streams()
             self._maybe_finish_playlist_discovery()
 
         self._new_stream(
@@ -3076,6 +3139,8 @@ class DownloadCoordinator:
     def _maybe_finish_playlist_discovery(self) -> None:
         if (
             self._playlist_listing_done
+            and not self._pending_playlists
+            and self._active_playlist_streams == 0
             and len(self._playlist_done) == self._playlist_count
         ):
             self._finish_discovery()
