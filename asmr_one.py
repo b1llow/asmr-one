@@ -741,7 +741,9 @@ def truncate_utf8(value: str, max_bytes: int) -> str:
 
 
 def sanitize(name: str, *, max_bytes: int = MAX_LOCAL_COMPONENT_BYTES) -> str:
-    name = re.sub(r"[\\/:*?\"<>|]+", "_", name).strip(" .")
+    name = re.sub(r"[\x00-\x1f\x7f-\x9f\\/:*?\"<>|]+", "_", name).strip(
+        " ."
+    )
     name = truncate_utf8(name, max_bytes).rstrip(" .")
     return name or "untitled"
 
@@ -749,7 +751,9 @@ def sanitize(name: str, *, max_bytes: int = MAX_LOCAL_COMPONENT_BYTES) -> str:
 def sanitize_filename(
     name: str, *, max_bytes: int = MAX_LOCAL_COMPONENT_BYTES
 ) -> str:
-    cleaned = re.sub(r"[\\/:*?\"<>|]+", "_", name).strip(" .")
+    cleaned = re.sub(
+        r"[\x00-\x1f\x7f-\x9f\\/:*?\"<>|]+", "_", name
+    ).strip(" .")
     suffix = Path(cleaned).suffix
     suffix_size = len(suffix.encode("utf-8"))
     if suffix and suffix_size < max_bytes:
@@ -1367,26 +1371,45 @@ class Client:
             if isinstance(payload.get("pagination"), dict)
             else {}
         )
-        current = int(pagination.get("currentPage") or pagination.get("page") or page)
-        page_count = pagination.get("pageCount") or pagination.get("totalPages")
-        if page_count is not None and current >= int(page_count):
-            return max(1, int(page_count))
-        if page_count is not None:
-            return max(1, int(page_count))
-        try:
-            effective_page_size = int(pagination.get("pageSize") or page_size)
-        except (TypeError, ValueError):
-            effective_page_size = page_size
-        if effective_page_size < 1:
-            effective_page_size = page_size
+        def pagination_int(value: Any, label: str, *, minimum: int) -> int:
+            if isinstance(value, bool):
+                raise PayloadError(f"invalid pagination {label}: {value!r}")
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError) as exc:
+                raise PayloadError(
+                    f"invalid pagination {label}: {value!r}"
+                ) from exc
+            if parsed < minimum:
+                raise PayloadError(f"invalid pagination {label}: {value!r}")
+            return parsed
+
+        current_value = pagination.get("currentPage")
+        if current_value is None:
+            current_value = pagination.get("page")
+        current = (
+            page
+            if current_value is None
+            else pagination_int(current_value, "current page", minimum=1)
+        )
+        page_count_value = pagination.get("pageCount")
+        if page_count_value is None:
+            page_count_value = pagination.get("totalPages")
+        if page_count_value is not None:
+            return max(
+                1,
+                pagination_int(page_count_value, "page count", minimum=0),
+            )
+        page_size_value = pagination.get("pageSize")
+        effective_page_size = (
+            page_size
+            if page_size_value is None
+            else pagination_int(page_size_value, "page size", minimum=1)
+        )
         total_count = pagination.get("totalCount")
         if total_count is not None:
-            try:
-                total = max(0, int(total_count))
-            except (TypeError, ValueError):
-                pass
-            else:
-                return max(1, (total + effective_page_size - 1) // effective_page_size)
+            total = pagination_int(total_count, "total count", minimum=0)
+            return max(1, (total + effective_page_size - 1) // effective_page_size)
         return current if page_items < effective_page_size else None
 
     @classmethod
@@ -2181,6 +2204,29 @@ def installed_file_stat(
     return actual
 
 
+def open_partial_file(path: Path, *, truncate: bool) -> Any:
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise LocalStateError("safe partial files require O_NOFOLLOW support")
+    flags = os.O_RDWR | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if truncate:
+        flags |= os.O_CREAT | os.O_TRUNC
+    try:
+        fd = os.open(path, flags, 0o644)
+    except OSError as exc:
+        if path.is_symlink():
+            raise LocalStateError(f"partial file must not be a symlink: {path}") from exc
+        raise
+    try:
+        if not stat_module.S_ISREG(os.fstat(fd).st_mode):
+            raise LocalStateError(f"partial file is not a regular file: {path}")
+        return os.fdopen(fd, "r+b")
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def open_validated_partial(
     dest: Path,
     remote: dict[str, Any],
@@ -2199,10 +2245,10 @@ def open_validated_partial(
         or (expected_size is not None and state.committed_size > expected_size)
     ):
         return None, hasher, None, None
-    if tmp.is_symlink() or not tmp.is_file():
-        raise LocalStateError(f"partial file is not a regular file: {tmp}")
-
-    fh = tmp.open("r+b")
+    try:
+        fh = open_partial_file(tmp, truncate=False)
+    except FileNotFoundError:
+        return None, new_blake3_hasher(), None, None
     try:
         actual_size = os.fstat(fh.fileno()).st_size
         if actual_size < state.committed_size:
@@ -2429,7 +2475,7 @@ def download_one(
                 raise DownloadProtocolError(str(exc)) from exc
             effective_size = total if effective_size is None else effective_size
             selected_etag = strong_etag(headers)
-            fh = tmp.open("wb")
+            fh = open_partial_file(tmp, truncate=True)
             checkpoint_partial(dest, fh, hasher, remote, selected_etag)
         elif status != 200:
             raise DownloadProtocolError(f"unexpected download HTTP status {status}")
@@ -2450,7 +2496,7 @@ def download_one(
             if effective_size is None and content_length is not None:
                 effective_size = content_length
             selected_etag = strong_etag(headers)
-            fh = tmp.open("wb")
+            fh = open_partial_file(tmp, truncate=True)
             checkpoint_partial(dest, fh, hasher, remote, selected_etag)
 
         start_size = existing
@@ -2462,12 +2508,41 @@ def download_one(
         )
         received_size = 0
         last_checkpoint = start_size
+        body_limit = expected_body_size
+        if body_limit is None and effective_size is not None:
+            body_limit = max(0, effective_size - start_size)
+
+        def reject_oversized_body() -> None:
+            fh.truncate(start_size)
+            fh.seek(start_size)
+            checkpoint_partial(
+                dest,
+                fh,
+                start_hasher,
+                remote,
+                start_etag,
+            )
+            raise DownloadProtocolError(
+                f"response body exceeds permitted size {body_limit}"
+            )
+
         try:
             while True:
                 try:
-                    chunk = resp.read(DOWNLOAD_CHUNK_SIZE)
+                    read_size = DOWNLOAD_CHUNK_SIZE
+                    if body_limit is not None:
+                        read_size = min(
+                            read_size,
+                            body_limit - received_size + 1,
+                        )
+                    chunk = resp.read(read_size)
                 except http.client.IncompleteRead as exc:
                     chunk = bytes(exc.partial or b"")
+                    if (
+                        body_limit is not None
+                        and received_size + len(chunk) > body_limit
+                    ):
+                        reject_oversized_body()
                     if chunk:
                         fh.write(chunk)
                         hasher.update(chunk)
@@ -2490,6 +2565,11 @@ def download_one(
                     raise DownloadTransportError(str(exc)) from exc
                 if not chunk:
                     break
+                if (
+                    body_limit is not None
+                    and received_size + len(chunk) > body_limit
+                ):
+                    reject_oversized_body()
                 fh.write(chunk)
                 hasher.update(chunk)
                 received_size += len(chunk)

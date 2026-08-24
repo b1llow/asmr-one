@@ -450,6 +450,19 @@ class PathSafetyTests(unittest.TestCase):
             len(wav.name.encode("utf-8")), asmr_one.MAX_LOCAL_COMPONENT_BYTES
         )
 
+    def test_local_names_replace_control_characters(self) -> None:
+        relative = asmr_one.relative_file_path(
+            remote_file("voice\nFAIL\x1b\x85.wav")
+        )
+        folder = work_folder_name(
+            {"source_id": "RJ1\r", "title": "title\tspoof\x7f"}
+        )
+
+        for value in (*relative.parts, folder):
+            self.assertFalse(
+                any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in value)
+            )
+
 
 class AuthTests(unittest.TestCase):
     def test_environment_token_precedes_saved_token(self) -> None:
@@ -1187,6 +1200,30 @@ class PlaylistTests(unittest.TestCase):
                 self.assertRaises(asmr_one.PayloadError),
             ):
                 fetch()
+
+    def test_pages_reject_malformed_pagination_integers(self) -> None:
+        client = asmr_one.Client()
+        for field in (
+            "currentPage",
+            "page",
+            "pageCount",
+            "totalPages",
+            "pageSize",
+            "totalCount",
+        ):
+            payload = {
+                "playlists": [],
+                "pagination": {field: "unknown"},
+            }
+            with (
+                self.subTest(field=field),
+                patch.object(client, "request", return_value=(200, payload)),
+                self.assertRaises(asmr_one.PayloadError) as raised,
+            ):
+                client.playlists_page(filter_by="all", page=1, page_size=2)
+            self.assertFalse(
+                asmr_one.is_retryable_network_error(raised.exception)
+            )
 
     def test_collect_works_uses_all_playlists_and_deduplicates(self) -> None:
         client = MagicMock()
@@ -2302,6 +2339,41 @@ class ChecksumTests(unittest.TestCase):
                 )
                 self.assertTrue(response.closed)
 
+    def test_stream_stops_at_and_rejects_the_first_excess_byte(self) -> None:
+        read_sizes: list[int] = []
+
+        class RecordingResponse(FakeResponse):
+            def read(self, size: int = -1) -> bytes:
+                read_sizes.append(size)
+                return super().read(size)
+
+        response = RecordingResponse(b"abcdef")
+        client = MagicMock()
+        client.request.return_value = (200, response)
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "track.wav"
+
+            with self.assertRaises(asmr_one.DownloadProtocolError) as raised:
+                asmr_one.download_one(
+                    client,
+                    "https://cdn.example/track.wav",
+                    dest,
+                    5,
+                    resume=False,
+                    remote=download_remote(),
+                )
+
+            self.assertTrue(
+                asmr_one.is_retryable_network_error(raised.exception)
+            )
+            self.assertEqual(read_sizes, [6])
+            self.assertFalse(dest.exists())
+            self.assertEqual(asmr_one.part_file_path(dest).stat().st_size, 0)
+            state = asmr_one.load_partial_state(dest)
+            self.assertIsNotNone(state)
+            self.assertEqual(state.committed_size, 0)  # type: ignore[union-attr]
+            self.assertTrue(response.closed)
+
     def test_stable_remote_id_resumes_after_url_path_refresh(self) -> None:
         old_file = remote_file(
             url="https://cdn.example/old/track.wav?token=one",
@@ -2560,6 +2632,46 @@ class ChecksumTests(unittest.TestCase):
                 )
 
             self.assertEqual(outside.read_bytes(), b"hello")
+
+    def test_partial_symlink_created_during_request_is_never_followed(self) -> None:
+        responses = (
+            (200, {"Content-Length": "5"}),
+            (
+                206,
+                {
+                    "Content-Range": "bytes 0-4/5",
+                    "Content-Length": "5",
+                },
+            ),
+        )
+        for status, headers in responses:
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                dest = root / "track.wav"
+                part = asmr_one.part_file_path(dest)
+                outside = root / "outside.txt"
+                outside.write_bytes(b"do not truncate")
+                client = MagicMock()
+
+                def request(*_args: object, **_kwargs: object) -> tuple[int, FakeResponse]:
+                    part.symlink_to(outside)
+                    return status, FakeResponse(b"hello", headers)
+
+                client.request.side_effect = request
+                with self.assertRaisesRegex(
+                    asmr_one.LocalStateError,
+                    "partial file must not be a symlink",
+                ):
+                    asmr_one.download_one(
+                        client,
+                        "https://cdn.example/track.wav",
+                        dest,
+                        5,
+                        resume=False,
+                        remote=download_remote(),
+                    )
+
+                self.assertEqual(outside.read_bytes(), b"do not truncate")
 
     def test_symlinked_directory_below_work_root_is_rejected(self) -> None:
         client = MagicMock()
