@@ -67,6 +67,8 @@ DOWNLOAD_CHUNK_SIZE = 1024 * 1024
 PART_STATE_VERSION = 1
 PART_CHECKPOINT_SIZE = 64 * 1024 * 1024
 WORK_LOCK_FILE_NAME = ".asmr-one.lock"
+MAX_LOCAL_COMPONENT_BYTES = 240
+MAX_WORK_FOLDER_BYTES = 180
 RETRY_DELAYS = (60.0, 5 * 60.0, 30 * 60.0, 4 * 60 * 60.0, 24 * 60 * 60.0)
 MAX_RETRY_AFTER_SECONDS = RETRY_DELAYS[-1]
 
@@ -669,15 +671,22 @@ def work_identity(work: dict[str, Any]) -> tuple[str, str]:
     return "payload", json.dumps(work, ensure_ascii=False, sort_keys=True, default=str)
 
 
-def sanitize(name: str) -> str:
+def truncate_utf8(value: str, max_bytes: int) -> str:
+    if len(value.encode("utf-8")) <= max_bytes:
+        return value
+    return value.encode("utf-8")[:max_bytes].decode("utf-8", "ignore")
+
+
+def sanitize(name: str, *, max_bytes: int = MAX_LOCAL_COMPONENT_BYTES) -> str:
     name = re.sub(r"[\\/:*?\"<>|]+", "_", name).strip(" .")
+    name = truncate_utf8(name, max_bytes).rstrip(" .")
     return name or "untitled"
 
 
 def work_folder_name(work: dict[str, Any]) -> str:
-    source = str(work.get("source_id") or work.get("id") or "work")
+    source = sanitize(str(work.get("source_id") or work.get("id") or "work"))
     title = sanitize(str(work.get("title") or "untitled"))
-    return f"{source} {title}"[:180]
+    return sanitize(f"{source} {title}", max_bytes=MAX_WORK_FOLDER_BYTES)
 
 
 def flatten_tracks(nodes: Any, prefix: tuple[str, ...] = ()) -> list[dict[str, Any]]:
@@ -749,16 +758,20 @@ def select_files(
     include_subs: bool,
     all_langs: bool,
 ) -> list[dict[str, Any]]:
-    if all_langs and audio_format == "all":
-        chosen = files
+    if not all_langs:
+        best_lang = min((path_lang_score(f["path"]) for f in files), default=1)
+        files = [f for f in files if path_lang_score(f["path"]) == best_lang]
+
+    if audio_format == "all":
+        chosen = [f for f in files if include_subs or f["ext"] not in SUB_EXTS]
     else:
-        if not all_langs:
-            best_lang = min((path_lang_score(f["path"]) for f in files), default=1)
-            files = [f for f in files if path_lang_score(f["path"]) == best_lang]
         audio = [f for f in files if f["ext"] in AUDIO_EXTS or f["type"] == "audio"]
-        if audio_format != "all" and audio:
+        if audio_format == "best" and audio:
             best = min(format_rank(f["ext"], audio_format) for f in audio)
             audio = [f for f in audio if format_rank(f["ext"], audio_format) == best]
+        elif audio_format != "best":
+            wanted = f".{audio_format.lstrip('.').lower()}"
+            audio = [f for f in audio if f["ext"].lower() == wanted]
         chosen = list(audio)
         if include_subs:
             audio_stems = {Path(f["title"]).stem.lower() for f in audio}
@@ -863,10 +876,12 @@ class Client:
             "Origin": "https://asmr.one",
             "Accept": "application/json, */*",
         }
-        if self.token:
-            headers["Authorization"] = f"Bearer {self.token}"
         if extra:
-            headers.update(extra)
+            headers.update(
+                key_value
+                for key_value in extra.items()
+                if key_value[0].casefold() != "authorization"
+            )
         return headers
 
     def request(
@@ -889,27 +904,37 @@ class Client:
             extra["Range"] = range_header
         last_err: Exception | None = None
         longest_retry_after: float | None = None
-        urls: list[str]
+        attempts: list[tuple[str, str | None]]
         if raw_url:
-            urls = [raw_url]
+            attempts = [(raw_url, None)]
         else:
             mirrors = (self.mirror,) + tuple(
                 mirror for mirror in DEFAULT_MIRRORS if mirror != self.mirror
             )
-            urls = [f"{mirror.rstrip('/')}{path}" for mirror in mirrors]
-        for url in urls:
+            attempts = [
+                (f"{mirror.rstrip('/')}{path}", mirror) for mirror in mirrors
+            ]
+        for url, api_mirror in attempts:
             req = urllib.request.Request(
                 url,
                 data=body,
                 method=method,
                 headers=self._headers(extra),
             )
+            if api_mirror is not None and self.token:
+                # Sent to the selected API mirror, but not copied by urllib
+                # when a redirect targets another origin.
+                req.add_unredirected_header(
+                    "Authorization", f"Bearer {self.token}"
+                )
             try:
                 resp = urllib.request.urlopen(
                     req, timeout=self.timeout, context=self._ctx
                 )
                 status = getattr(resp, "status", 200)
                 if stream:
+                    if api_mirror is not None:
+                        self.mirror = api_mirror
                     return status, resp
                 try:
                     raw = resp.read()
@@ -917,10 +942,14 @@ class Client:
                     resp.close()
                 if raw:
                     try:
-                        return status, json.loads(raw.decode("utf-8"))
+                        payload = json.loads(raw.decode("utf-8"))
                     except json.JSONDecodeError:
-                        return status, raw
-                return status, None
+                        payload = raw
+                else:
+                    payload = None
+                if api_mirror is not None:
+                    self.mirror = api_mirror
+                return status, payload
             except urllib.error.HTTPError as exc:
                 try:
                     payload = exc.read().decode("utf-8", "replace")
@@ -1002,7 +1031,19 @@ class Client:
     def tracks(self, work_id: str | int) -> list[dict[str, Any]]:
         lookup = re.sub(r"^(?:RJ|VJ)0*", "", str(work_id), flags=re.IGNORECASE)
         _, payload = self.request("GET", f"/api/tracks/{lookup}?v=2")
-        return flatten_tracks(payload)
+        if isinstance(payload, list):
+            nodes = payload
+        elif isinstance(payload, dict):
+            nodes = None
+            for key in ("children", "tracks", "files"):
+                if key in payload:
+                    nodes = payload[key]
+                    break
+            if not isinstance(nodes, list):
+                raise PayloadError(f"bad tracks payload for {work_id}")
+        else:
+            raise PayloadError(f"bad tracks payload for {work_id}")
+        return flatten_tracks(nodes)
 
     def _page(self, path: str, page: int, page_size: int) -> dict[str, Any]:
         qs = urllib.parse.urlencode(
@@ -1224,6 +1265,23 @@ def remote_fingerprint(file: dict[str, Any]) -> dict[str, Any]:
         "source_path": [str(part) for part in file.get("path") or ()],
         "size": expected_file_size(file),
     }
+
+
+def remote_identity_matches(
+    saved: Mapping[str, Any], current: Mapping[str, Any]
+) -> bool:
+    saved_id = saved.get("id")
+    current_id = current.get("id")
+    if (
+        isinstance(saved_id, str)
+        and bool(saved_id.strip())
+        and isinstance(current_id, str)
+        and saved_id == current_id
+    ):
+        return saved.get("source_path") == current.get(
+            "source_path"
+        ) and saved.get("size") == current.get("size")
+    return dict(saved) == dict(current)
 
 
 def local_path_key(path: Path) -> str:
@@ -1450,9 +1508,7 @@ def partial_identity_is_usable(state: PartialState, remote: dict[str, Any]) -> b
         and isinstance(remote_id, str)
         and state_remote_id == remote_id
     ):
-        return state.remote.get("source_path") == remote.get(
-            "source_path"
-        ) and state.remote.get("size") == remote.get("size")
+        return remote_identity_matches(state.remote, remote)
     return state.etag is not None and state.remote == remote
 
 
@@ -1470,14 +1526,31 @@ def update_hasher_from_file(hasher: Any, path: Path) -> None:
             hasher.update(chunk)
 
 
-def checksum_file(path: Path) -> str:
+def checksum_file(
+    path: Path, *, return_stat: bool = False
+) -> str | tuple[str, os.stat_result]:
+    if path.is_symlink() or not path.is_file():
+        raise LocalStateError(f"checksum target is not a regular file: {path}")
+    before = path.stat()
     hasher = new_blake3_hasher()
     update_hasher_from_file(hasher, path)
-    return hasher.hexdigest()
+    if path.is_symlink() or not path.is_file():
+        raise LocalStateError(f"checksum target changed while hashing: {path}")
+    after = path.stat()
+    if stat_signature(before) != stat_signature(after):
+        raise LocalStateError(f"checksum target changed while hashing: {path}")
+    digest = hasher.hexdigest()
+    return (digest, after) if return_stat else digest
 
 
-def checksum_record(file: dict[str, Any], dest: Path, digest: str) -> dict[str, Any]:
-    stat = dest.stat()
+def checksum_record(
+    file: dict[str, Any],
+    dest: Path,
+    digest: str,
+    *,
+    stat_result: os.stat_result | None = None,
+) -> dict[str, Any]:
+    stat = stat_result or dest.stat()
     return {
         "remote": remote_fingerprint(file),
         "size": stat.st_size,
@@ -1493,6 +1566,7 @@ def prepare_local_files(
 ) -> tuple[list[LocalFileContext], bool]:
     mapped: list[tuple[dict[str, Any], Path, str, str]] = []
     occupied: dict[str, str] = {}
+    occupied_descendants: dict[str, str] = {}
     reserved = {
         local_path_key(Path(CHECKSUM_FILE_NAME)): CHECKSUM_FILE_NAME,
         local_path_key(Path(WORK_LOCK_FILE_NAME)): WORK_LOCK_FILE_NAME,
@@ -1516,11 +1590,21 @@ def prepare_local_files(
         ):
             key = local_path_key(local_path)
             previous = occupied.get(key)
+            parts = key.split("/")
+            if previous is None:
+                for index in range(1, len(parts)):
+                    previous = occupied.get("/".join(parts[:index]))
+                    if previous is not None:
+                        break
+            if previous is None:
+                previous = occupied_descendants.get(key)
             if previous is not None:
                 raise LocalStateError(
                     f"remote paths collide locally after sanitizing: {previous!r} and {label!r}"
                 )
             occupied[key] = label
+            for index in range(1, len(parts)):
+                occupied_descendants.setdefault("/".join(parts[:index]), label)
         mapped.append(
             (file, root / relative, relative_string, local_path_key(relative))
         )
@@ -1565,7 +1649,9 @@ def inspect_local_file(context: LocalFileContext, *, verify: bool) -> FileInspec
     expected_size = expected_file_size(file)
     fingerprint = remote_fingerprint(file)
     remote_matches = bool(
-        isinstance(record, dict) and record.get("remote") == fingerprint
+        isinstance(record, dict)
+        and isinstance(record.get("remote"), dict)
+        and remote_identity_matches(record["remote"], fingerprint)
     )
     part_exists = part.exists()
     part_size = part.stat().st_size if part_exists else 0
@@ -1587,12 +1673,12 @@ def inspect_local_file(context: LocalFileContext, *, verify: bool) -> FileInspec
     partial_stale = bool(
         part_exists
         and partial_state is not None
-        and partial_state.remote != fingerprint
+        and not partial_identity_is_usable(partial_state, fingerprint)
     )
 
     if not dest.exists():
         if part_exists and isinstance(record, dict) and not remote_matches:
-            plan = LocalFilePlan(file, dest, relative, "stale", resume=False)
+            plan = LocalFilePlan(file, dest, relative, "stale", resume=part_usable)
         elif partial_stale:
             plan = LocalFilePlan(file, dest, relative, "stale", resume=False)
         elif (
@@ -1611,7 +1697,7 @@ def inspect_local_file(context: LocalFileContext, *, verify: bool) -> FileInspec
     stat = dest.stat()
     if isinstance(record, dict) and not remote_matches:
         return FileInspection(
-            plan=LocalFilePlan(file, dest, relative, "stale", resume=False)
+            plan=LocalFilePlan(file, dest, relative, "stale", resume=part_usable)
         )
     if expected_size is not None and stat.st_size != expected_size:
         return FileInspection(
@@ -1637,8 +1723,16 @@ def inspect_local_file(context: LocalFileContext, *, verify: bool) -> FileInspec
 
 
 def hash_local_file(context: LocalFileContext) -> HashedFile:
-    digest = checksum_file(context.dest)
-    return HashedFile(digest, checksum_record(context.file, context.dest, digest))
+    digest, stat_result = checksum_file(context.dest, return_stat=True)
+    return HashedFile(
+        digest,
+        checksum_record(
+            context.file,
+            context.dest,
+            digest,
+            stat_result=stat_result,
+        ),
+    )
 
 
 def resolve_hashed_file(
@@ -3007,7 +3101,7 @@ def build_parser() -> argparse.ArgumentParser:
     who.set_defaults(func=cmd_whoami)
 
     playlists = sub.add_parser("playlists", help="list available asmr.one playlists")
-    playlists.add_argument("--page-size", type=int, default=50)
+    playlists.add_argument("--page-size", type=positive_int, default=50)
     playlists.set_defaults(func=cmd_playlists)
 
     common = argparse.ArgumentParser(add_help=False)
@@ -3017,7 +3111,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
         help="default auto = playlists; favorites is a compatibility alias",
     )
-    common.add_argument("--page-size", type=int, default=50)
+    common.add_argument("--page-size", type=positive_int, default=50)
     common.add_argument("--limit", type=int)
     collection = common.add_mutually_exclusive_group()
     collection.add_argument(

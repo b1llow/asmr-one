@@ -210,6 +210,89 @@ class SelectTests(unittest.TestCase):
         self.assertNotIn(":", name)
 
 
+class SelectBehaviorTests(unittest.TestCase):
+    def test_all_without_subtitles_keeps_other_file_types(self) -> None:
+        audio = remote_file("voice.wav")
+        subtitle = remote_file("voice.srt")
+        subtitle.update(type="file", ext=".srt")
+        image = remote_file("cover.jpg")
+        image.update(type="file", ext=".jpg")
+
+        chosen = select_files(
+            [audio, subtitle, image],
+            audio_format="all",
+            include_subs=False,
+            all_langs=True,
+        )
+
+        self.assertEqual(
+            [file["title"] for file in chosen], ["voice.wav", "cover.jpg"]
+        )
+
+    def test_explicit_format_does_not_fall_back(self) -> None:
+        chosen = select_files(
+            [remote_file("voice.wav"), remote_file("voice.flac")],
+            audio_format="mp3",
+            include_subs=False,
+            all_langs=True,
+        )
+
+        self.assertEqual(chosen, [])
+
+    def test_ja_only_with_all_keeps_japanese_non_audio_files(self) -> None:
+        japanese_audio = remote_file(
+            "voice.wav", path=("日本語", "voice.wav")
+        )
+        japanese_video = remote_file(
+            "scene.mp4", path=("日本語", "scene.mp4")
+        )
+        japanese_video.update(type="video", ext=".mp4")
+        english_audio = remote_file(
+            "voice.wav", path=("English", "voice.wav")
+        )
+
+        chosen = select_files(
+            [japanese_audio, japanese_video, english_audio],
+            audio_format="all",
+            include_subs=True,
+            all_langs=False,
+        )
+
+        self.assertEqual(
+            [file["path"] for file in chosen],
+            [("日本語", "voice.wav"), ("日本語", "scene.mp4")],
+        )
+
+
+class PathSafetyTests(unittest.TestCase):
+    def test_work_folder_sanitizes_source_and_limits_utf8_bytes(self) -> None:
+        name = work_folder_name(
+            {"source_id": "../../escape", "title": "月" * 200}
+        )
+
+        self.assertNotIn("/", name)
+        self.assertNotIn("\\", name)
+        self.assertLessEqual(
+            len(name.encode("utf-8")), asmr_one.MAX_WORK_FOLDER_BYTES
+        )
+
+    def test_track_components_leave_room_for_partial_state_suffix(self) -> None:
+        relative = asmr_one.relative_file_path(
+            remote_file("月" * 200 + ".wav")
+        )
+
+        self.assertTrue(
+            all(
+                len(part.encode("utf-8"))
+                <= asmr_one.MAX_LOCAL_COMPONENT_BYTES
+                for part in relative.parts
+            )
+        )
+        self.assertLessEqual(
+            len(asmr_one.part_state_path(relative).name.encode("utf-8")), 255
+        )
+
+
 class AuthTests(unittest.TestCase):
     def test_environment_token_precedes_saved_token(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -330,6 +413,92 @@ class AuthTests(unittest.TestCase):
 
 
 class ClientTests(unittest.TestCase):
+    def test_bearer_token_is_limited_to_the_api_request(self) -> None:
+        requests: list[asmr_one.urllib.request.Request] = []
+
+        def urlopen(
+            request: asmr_one.urllib.request.Request, **_kwargs: object
+        ) -> FakeResponse:
+            requests.append(request)
+            return FakeResponse(b"{}")
+
+        with (
+            patch.object(asmr_one, "DEFAULT_MIRRORS", ("https://api.example",)),
+            patch("asmr_one.urllib.request.urlopen", side_effect=urlopen),
+        ):
+            client = asmr_one.Client(token="secret")
+            _, response = client.request(
+                "GET", "", raw_url="https://cdn.example/file", stream=True
+            )
+            response.close()
+            client.request("GET", "/me")
+
+        raw_request, api_request = requests
+        self.assertIsNone(raw_request.get_header("Authorization"))
+        self.assertEqual(api_request.get_header("Authorization"), "Bearer secret")
+        redirected = asmr_one.urllib.request.HTTPRedirectHandler().redirect_request(
+            api_request,
+            None,
+            302,
+            "Found",
+            {},
+            "https://cdn.example/redirected",
+        )
+        self.assertIsNotNone(redirected)
+        self.assertIsNone(redirected.get_header("Authorization"))
+
+    def test_successful_fallback_mirror_is_promoted(self) -> None:
+        mirrors = ("https://preferred.example", "https://fallback.example")
+        attempts: list[str] = []
+        responses: deque[object] = deque(
+            [
+                asmr_one.urllib.error.URLError("down"),
+                FakeResponse(b"{}"),
+                FakeResponse(b"{}"),
+            ]
+        )
+
+        def urlopen(
+            request: asmr_one.urllib.request.Request, **_kwargs: object
+        ) -> FakeResponse:
+            attempts.append(request.full_url)
+            response = responses.popleft()
+            if isinstance(response, BaseException):
+                raise response
+            return response
+
+        with (
+            patch.object(asmr_one, "DEFAULT_MIRRORS", mirrors),
+            patch("asmr_one.urllib.request.urlopen", side_effect=urlopen),
+        ):
+            client = asmr_one.Client()
+            client.request("GET", "/first")
+            self.assertEqual(client.mirror, mirrors[1])
+            client.request("GET", "/second")
+
+        self.assertEqual(
+            attempts,
+            [
+                f"{mirrors[0]}/first",
+                f"{mirrors[1]}/first",
+                f"{mirrors[1]}/second",
+            ],
+        )
+
+    def test_tracks_rejects_malformed_success_payloads(self) -> None:
+        client = asmr_one.Client()
+        for payload in (None, "bad", {}, {"error": "bad"}, {"tracks": None}):
+            with (
+                self.subTest(payload=payload),
+                patch.object(client, "request", return_value=(200, payload)),
+                self.assertRaises(asmr_one.PayloadError) as raised,
+            ):
+                client.tracks("RJ1")
+            self.assertFalse(asmr_one.is_retryable_network_error(raised.exception))
+
+        with patch.object(client, "request", return_value=(200, {"tracks": []})):
+            self.assertEqual(client.tracks("RJ1"), [])
+
     def test_incomplete_json_response_becomes_retryable_transport_error(self) -> None:
         client = asmr_one.Client()
         with (
@@ -689,6 +858,25 @@ class ChecksumTests(unittest.TestCase):
             self.assertEqual(plans[0].status, "valid")
             self.assertEqual(updates, {})
 
+    def test_stable_remote_id_ignores_refreshed_url_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dest = root / "track.wav"
+            dest.write_bytes(b"hello")
+            old = remote_file(url="https://cdn.example/old/track.wav")
+            refreshed = remote_file(url="https://cdn.example/new/track.wav")
+            manifest = asmr_one.empty_checksum_manifest()
+            manifest["files"]["track.wav"] = asmr_one.checksum_record(
+                old, dest, asmr_one.checksum_file(dest)
+            )
+
+            plans, updates, _ = asmr_one.classify_local_files(
+                root, [refreshed], manifest, verify=False
+            )
+
+            self.assertEqual(plans[0].status, "valid")
+            self.assertEqual(updates, {})
+
     def test_reserved_and_sanitized_path_collisions_are_rejected(self) -> None:
         manifest = asmr_one.empty_checksum_manifest()
         with tempfile.TemporaryDirectory() as tmp:
@@ -737,11 +925,95 @@ class ChecksumTests(unittest.TestCase):
                     verify=False,
                 )
 
+            ancestor = remote_file("audio_", path=("audio_",))
+            descendant = remote_file(
+                "track.wav", path=("audio_", "track.wav")
+            )
+            for files in ([ancestor, descendant], [descendant, ancestor]):
+                with self.assertRaisesRegex(asmr_one.LocalStateError, "collide"):
+                    asmr_one.classify_local_files(
+                        Path(tmp), files, manifest, verify=False
+                    )
+
             with self.assertRaisesRegex(asmr_one.LocalStateError, "reserved"):
                 asmr_one.checksum_manifest_key(
                     asmr_one.WORK_LOCK_FILE_NAME,
                     Path(tmp) / asmr_one.CHECKSUM_FILE_NAME,
                 )
+
+    def test_hash_rejects_destination_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dest = root / "track.wav"
+            dest.write_bytes(b"hello")
+            context = asmr_one.LocalFileContext(
+                remote_file(), dest, "track.wav", "track.wav", None
+            )
+            original_update = asmr_one.update_hasher_from_file
+
+            def replace_after_hash(hasher: object, path: Path) -> None:
+                original_update(hasher, path)
+                replacement = path.with_name("replacement.wav")
+                replacement.write_bytes(b"world")
+                os.replace(replacement, path)
+
+            with (
+                patch(
+                    "asmr_one.update_hasher_from_file",
+                    side_effect=replace_after_hash,
+                ),
+                self.assertRaisesRegex(
+                    asmr_one.LocalStateError, "changed while hashing"
+                ),
+            ):
+                asmr_one.hash_local_file(context)
+
+    def test_stale_destination_can_resume_matching_replacement_partial(self) -> None:
+        old = remote_file(remote_id="work/old")
+        current = remote_file(remote_id="work/current")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dest = root / "track.wav"
+            dest.write_bytes(b"hello")
+            checkpoint_part(
+                dest,
+                b"wo",
+                remote=asmr_one.remote_fingerprint(current),
+            )
+            manifest = asmr_one.empty_checksum_manifest()
+            manifest["files"]["track.wav"] = asmr_one.checksum_record(
+                old, dest, asmr_one.checksum_file(dest)
+            )
+
+            plans, _, _ = asmr_one.classify_local_files(
+                root, [current], manifest, verify=False
+            )
+
+            self.assertEqual(plans[0].status, "stale")
+            self.assertTrue(plans[0].resume)
+            self.assertEqual(dest.read_bytes(), b"hello")
+
+    def test_refreshed_url_path_keeps_matching_partial_resumable(self) -> None:
+        old = remote_file(url="https://cdn.example/old/track.wav")
+        refreshed = remote_file(url="https://cdn.example/new/track.wav")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dest = root / "track.wav"
+            checkpoint_part(
+                dest,
+                b"he",
+                remote=asmr_one.remote_fingerprint(old),
+            )
+
+            plans, _, _ = asmr_one.classify_local_files(
+                root,
+                [refreshed],
+                asmr_one.empty_checksum_manifest(),
+                verify=False,
+            )
+
+            self.assertEqual(plans[0].status, "partial")
+            self.assertTrue(plans[0].resume)
 
     def test_normalized_manifest_lookup_redownloads_case_changed_remote(self) -> None:
         work = {"id": 1, "source_id": "RJ000001", "title": "Case"}
@@ -2525,6 +2797,23 @@ class GlobalTaskSchedulerTests(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     asmr_one.build_parser().parse_args(
                         ["download", "--jobs", value, "--work", "RJ1"]
+                    )
+
+    def test_parsers_reject_non_positive_page_sizes(self) -> None:
+        commands = (
+            ["playlists"],
+            ["list", "--work", "RJ1"],
+            ["download", "--work", "RJ1"],
+        )
+        for command in commands:
+            for value in ("0", "-1"):
+                with (
+                    self.subTest(command=command[0], value=value),
+                    redirect_stderr(io.StringIO()),
+                    self.assertRaises(SystemExit),
+                ):
+                    asmr_one.build_parser().parse_args(
+                        [command[0], "--page-size", value, *command[1:]]
                     )
 
 

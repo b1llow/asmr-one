@@ -101,9 +101,10 @@ neither files nor locks.
 
 Filters (opt-in):
 
-- `--format mp3|wav|flac|best` — keep one audio format
+- `--format all|mp3|wav|flac|best` — `all` is the default and keeps every
+  file; the other values filter audio formats
 - `--ja-only` — Japanese edition only
-- `--no-subs` — drop lrc/vtt when filtering
+- `--no-subs` — drop recognized subtitle files
 - `--jobs 8` — eight global workers for discovery, local checks, hashes, and downloads
 - `--verify` — fully hash selected existing files before filtering downloads
 - `--source auto|playlists|favorites|review` — `auto` is playlists; `favorites`
